@@ -19,3 +19,9 @@ venv/
 # Local environment variables
 .env
 .env.*
+
+# 텔레옵 실행 기록
+logs/
+
+# archify 작업 폴더 (다이어그램 후보와 중간 결과)
+.archify/

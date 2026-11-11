@@ -1,10 +1,5 @@
 from .config_spacemouse4rby1 import SpaceMouse4Rby1Config
-from .spacemouse4rby1 import (
-    SpaceMouse4Rby1,
-    install_lerobot_bridge,
-)
-
-install_lerobot_bridge()
+from .spacemouse4rby1 import SpaceMouse4Rby1
 
 __all__ = [
     "SpaceMouse4Rby1Config",

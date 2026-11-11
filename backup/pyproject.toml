@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=71", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_teleoperator_spacemouse4rby1"
+version = "0.1.0"
+description = "Dual SpaceMouse teleoperator for RB-Y1 using LeRobot"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "lerobot>=0.5.0,<0.7.0",
+    "rby1-sdk",
+    "pyspacemouse==2.1.0",
+    "numpy>=2.0.0,<2.3.0",
+    "scipy>=1.14.0,<2.0.0",
+]
+
+[project.optional-dependencies]
+# LeRobot 0.6 환경에서 텔레옵·녹화 CLI 의존성까지 설치할 때 사용
+cli = [
+    "lerobot[core_scripts]>=0.6.0,<0.7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lerobot_teleoperator_spacemouse4rby1*"]

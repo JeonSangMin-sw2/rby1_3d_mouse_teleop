@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "architecture",
+  "quality": "showcase",
+  "specification": {
+    "path": "/home/rainbow/rby1_3d_mouse_teleop/.archify/architecture-teleop-20261111-110928/candidate.json",
+    "sha256": "0e78e024fc20436403984ed72850187118e1b0f5380370a62a81b310bbf824f3",
+    "bytes": 4692
+  },
+  "artifact": {
+    "path": "/home/rainbow/rby1_3d_mouse_teleop/docs/architecture.html",
+    "sha256": "d8c1f70009d22637a9986112ac8cb82394fbc89ba3aec3280c78f357abd64346",
+    "bytes": 859964
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/home/rainbow/rby1_3d_mouse_teleop/docs/architecture.finalize.json",
+    "summaryReceipt": "/home/rainbow/rby1_3d_mouse_teleop/docs/architecture.finalize-summary.json",
+    "browserCheckReceipt": "/home/rainbow/rby1_3d_mouse_teleop/docs/architecture.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-11-11T02:09:51.418Z",
+    "source": "network",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 1766,
+  "browserCheck": {
+    "requested": true,
+    "ran": true
+  }
+}

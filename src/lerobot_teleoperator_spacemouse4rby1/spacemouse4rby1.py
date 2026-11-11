@@ -1,64 +1,94 @@
-"""LeRobot teleoperator for two SpaceMouse devices and RB-Y1."""
+"""두 SpaceMouse로 RB-Y1 양팔 입력을 만드는 LeRobot teleoperator. 로봇 명령은 없다.
 
-import sys
+get_action()은 팔마다 base 기준 twist(-1~1)와 그리퍼 닫힘(0/1)을 반환한다.
+send_feedback()으로 받은 목표 그리퍼 자세는 그리퍼 좌표계 기준 이동에 쓴다.
+버튼·키보드로 바꾸는 모드와 그리퍼 토글은 여기서 처리하고 events로 알린다.
+"""
+
 import time
 from contextlib import ExitStack
-from functools import wraps
-from pathlib import Path
 
 import numpy as np
+import pyspacemouse
+from lerobot.teleoperators.teleoperator import Teleoperator
 from scipy.spatial.transform import Rotation
 
-from lerobot.teleoperators.teleoperator import Teleoperator
-
-from .action_mapper import Rby1ActionMapper
+from . import settings
 from .config_spacemouse4rby1 import SpaceMouse4Rby1Config
-from .devices import AXES, DualSpaceMouse, SingleLeftSpaceMouse
-from .pose_integrator import DualPoseIntegrator
-from .rby1_state import Rby1StateReader
+from .events import EventBus, GripperChanged, ModeChanged
+from .mouse import (
+    ARM_MODES,
+    AXES,
+    BUTTON0,
+    BUTTON1,
+    COMBO,
+    FRAMES,
+    LOCK_MODES,
+    SIDES,
+    ButtonTracker,
+    apply_arm_mode,
+    apply_lock,
+    initialize,
+    next_mode,
+    open_spacemouse,
+    read_latest,
+    to_base,
+    tool_to_base,
+)
+
+TWIST_KEYS = ("x", "y", "z", "rx", "ry", "rz")
+ROTVEC_KEYS = ("rx", "ry", "rz")
+ARM_MODE_KEYS = {"m": "mirroring", "t": "tracking"}
 
 
 class SpaceMouse4Rby1(Teleoperator):
     config_class = SpaceMouse4Rby1Config
     name = "spacemouse4rby1"
 
-    def __init__(self, config):
+    def __init__(self, config, events=None):
         super().__init__(config)
-
         self.config = config
+        self.events = events if events is not None else EventBus()
 
-        if config.single_device:
-            self.devices = SingleLeftSpaceMouse(config.left_device)
-        else:
-            self.devices = DualSpaceMouse(
-                config.left_device,
-                config.right_device,
-            )
+        if settings.MAIN_ARM not in SIDES:
+            raise ValueError(f"main_arm은 right 또는 left여야 합니다: {settings.MAIN_ARM!r}")
 
-        self.state_reader = Rby1StateReader(
-            config.robot_address,
-            config.robot_model,
-        )
-        self.integrator = DualPoseIntegrator(config)
-        self.mapper = Rby1ActionMapper(config.use_gripper)
+        for key in ("translation_curve_temperature", "rotation_curve_temperature"):
+            if not getattr(settings, key.upper()) >= 0.0:
+                raise ValueError(f"{key}는 0 이상이어야 합니다: {getattr(settings, key.upper())!r}")
 
         self._stack = None
-        self._follower = None
-        self._initialized = False
-        self._wait_neutral = True
-        self._last_update = None
-        self._was_active = {
-            "left": False,
-            "right": False,
-        }
+        self._devices = {}
+        self._calibrations = None
+        self._buttons = {side: ButtonTracker(settings.COMBO_WINDOW_S) for side in SIDES}
+        self._tool_rotations = None
+
+        self.locks = {side: LOCK_MODES[0] for side in SIDES}
+        self.frames = {side: FRAMES[0] for side in SIDES}
+        self.arm_mode = "normal"
+        self.leader = settings.MAIN_ARM
+        self.gripper_closed = {side: False for side in SIDES}
+        self.wrist_only = {side: False for side in SIDES}
+        # 실행 기록용: 마지막으로 읽은 마우스 6축 원래 값과 그 값이 오래되지 않았는지
+        self.raw_axes = {side: np.zeros(6) for side in SIDES}
+        self.raw_fresh = {side: False for side in SIDES}
 
     @property
     def action_features(self):
-        return self.mapper.action_features
+        features = {
+            f"{side}_ee.{key}": float for side in SIDES for key in TWIST_KEYS
+        }
+        # 1이면 그리퍼 좌표계 z축 회전만 하는 중이다 (컨트롤러가 손목 위주로 돌린다).
+        features.update({f"{side}_ee.wrist_only": float for side in SIDES})
+        features.update({f"{side}_gripper.closed": float for side in SIDES})
+        # ARM_MODES 순서 번호 (0 일반, 1 트래킹, 2 미러링). 따르는 팔은 main_arm이 아닌 팔이다.
+        features["follow.mode"] = float
+        return features
 
     @property
     def feedback_features(self):
-        return {}
+        # 목표 그리퍼(ee) 자세의 base 기준 회전 벡터
+        return {f"{side}_ee.{key}": float for side in SIDES for key in ROTVEC_KEYS}
 
     @property
     def is_connected(self):
@@ -66,275 +96,151 @@ class SpaceMouse4Rby1(Teleoperator):
 
     @property
     def is_calibrated(self):
-        return True
+        return self._calibrations is not None
 
     def connect(self, calibrate=True):
         if self.is_connected:
             raise RuntimeError("Teleoperator is already connected.")
 
+        detected = pyspacemouse.get_connected_devices_by_path()
+
+        if len(detected) < len(SIDES):
+            raise ConnectionError(
+                f"SpaceMouse가 {len(SIDES)}개 필요하지만 {len(detected)}개만 감지되었습니다."
+            )
+
         stack = ExitStack()
 
         try:
-            stack.enter_context(self.devices)
-            stack.enter_context(self.state_reader)
+            for path in sorted(detected):
+                self._devices[path] = open_spacemouse(stack, path)
         except BaseException:
             stack.close()
+            self._devices = {}
             raise
 
         self._stack = stack
 
-        # robot.connect()에서 ready 동작이 실행될 수 있으므로
-        # 여기서는 아직 목표 pose를 초기화하지 않는다.
-        self._initialized = False
-        self._wait_neutral = True
-        self._last_update = None
-
-        
-
-    def bind_robot(self, robot):
-        """기존 RBY1 robot의 connect()가 끝난 뒤 호출한다."""
-        if not self.is_connected or not robot.is_connected:
-            raise RuntimeError(
-                "Connect both teleoperator and robot first."
-            )
-
-        if robot.name != "rby1":
-            raise ValueError(
-                "This teleoperator requires the RBY1 robot plugin."
-            )
-
-        if set(robot.action_features) != set(self.action_features):
-            raise ValueError(
-                "Use robot.action_mode=ee with both arms enabled, "
-                "torso/mobile base disabled, and matching use_gripper."
-            )
-
-        if robot._config.address != self.config.robot_address:
-            raise ValueError(
-                "Robot and teleoperator addresses must match."
-            )
-
-        self._follower = robot
-        self.reset_targets()
-
-    def reset_targets(self):
-        """현재 실제 pose와 그리퍼 위치를 목표로 다시 설정한다."""
-        if not self.is_connected:
-            raise RuntimeError("Teleoperator is not connected.")
-
-        self._initialized = False
-        grippers = None
-
-        if self.config.use_gripper:
-            if self._follower is None:
-                raise RuntimeError(
-                    "Call bind_robot(robot) before requesting "
-                    "gripper actions."
-                )
-
-            obs = self._follower.get_observation()
-
-            grippers = {
-                side: obs[f"{side}_gripper_0.pos"]
-                for side in ("left", "right")
-            }
-
-        self.integrator.reset(
-            self.state_reader.read(),
-            grippers,
-        )
-
-        self._initialized = True
-        self._wait_neutral = True
-        self._last_update = None
-        self._was_active = {
-            "left": False,
-            "right": False,
-        }
-
-
-
-    def _is_neutral(self, inputs):
-        for raw in inputs.values():
-            axes = np.array(
-                [raw[key] for key in AXES],
-                dtype=float,
-            )
-
-            if not np.isfinite(axes).all():
-                raise ValueError("Invalid SpaceMouse axes.")
-
-            if (
-                np.any(np.abs(axes) > self.config.deadzone)
-                or any(raw["buttons"])
-            ):
-                return False
-
-        return True
-
-    def get_action(self):
-        if not self.is_connected:
-            raise RuntimeError("Teleoperator is not connected.")
-
-        if not self._initialized:
-            self.reset_targets()
-
-        # Linux에서 직접 연결된 장치가 제거되었는지 확인한다.
-        for path in self.devices.paths.values():
-            if not Path(path).exists():
-                raise ConnectionError(
-                    f"SpaceMouse path disappeared: {path}"
-                )
-
-        inputs = self.devices.read()
-        now = time.perf_counter()
-
-        # 루프가 오래 멈췄다면 이전 목표를 버리고 다시 초기화한다.
-        if (
-            self._last_update is not None
-            and now - self._last_update > 0.5
-        ):
-            self.reset_targets()
-
-        if self._wait_neutral:
-            self.reset_targets()
-            self._wait_neutral = not self._is_neutral(inputs)
-            self._last_update = time.perf_counter()
-
-            return self.mapper(
-                *self.integrator.get_targets()
-            )
-
-        dt = (
-            0.0
-            if self._last_update is None
-            else now - self._last_update
-        )
-        self._last_update = now
-
-
-
-        # 양쪽 마우스가 각각 움직임 입력 중인지 확인한다.
-        active = {}
-
-        for side in ("left", "right"):
-            raw = inputs[side]
-            sample_time = float(raw["t"])
-            sample_age = now - sample_time
-
-            sample_is_fresh = (
-                np.isfinite(sample_time)
-                and sample_time >= 0.0
-                and 0.0 <= sample_age <= self.config.input_timeout_s
-            )
-
-            active[side] = sample_is_fresh and any(
-                abs(float(raw[axis])) > self.config.deadzone
-                for axis in ("x", "y", "z", "roll", "pitch", "yaw")
-            )
-
-        # 움직이다가 중립 상태가 되거나 입력이 오래된 팔을 찾는다.
-        released_sides = [
-            side
-            for side in ("left", "right")
-            if self._was_active[side] and not active[side]
-        ]
-
-        self._was_active = active
-
-
-
-        poses, grippers = self.integrator.update(
-            inputs,
-            dt,
-            now=now,
-        )
-
-        # 마우스를 놓은 쪽 팔만 현재 실제 자세로 목표를 재설정한다.
-        # 반대쪽 팔의 이번 주기 입력과 그리퍼 목표는 그대로 유지한다.
-        if released_sides:
-            current_poses = self.state_reader.read()
-
-            for side in released_sides:
-                poses[side] = current_poses[side].copy()
-
-            self.integrator.reset(
-                poses=poses,
-                grippers=grippers if self.config.use_gripper else None,
-            )
-
-            poses, grippers = self.integrator.get_targets()
-
-            print(
-                "[MOUSE DEBUG] 입력 해제: "
-                f"{', '.join(released_sides)} 목표를 현재 자세로 재설정",
-                flush=True,
-            )
-        # 로봇이 목표를 따라가지 못할 때
-        # 가상 목표가 계속 멀어지는 것을 제한한다.
-        actual = self.state_reader.read()
-
-        # 0.5초마다 마우스 입력, 목표 위치, 실제 위치 확인
-        if now >= getattr(self, "_next_motion_debug", 0.0):
-            raw = inputs["left"]
-            target_xyz = poses["left"][:3, 3]
-            actual_xyz = actual["left"][:3, 3]
-
-            print(
-                "[MOUSE DEBUG]",
-                "input=",
-                {
-                    key: round(float(raw[key]), 3)
-                    for key in ("x", "y", "z", "roll", "pitch", "yaw")
-                },
-                "input_age_s=", round(now - float(raw["t"]), 3),
-                "target_xyz=", np.round(target_xyz, 4),
-                "actual_xyz=", np.round(actual_xyz, 4),
-                "error_m=", round(
-                    float(np.linalg.norm(target_xyz - actual_xyz)),
-                    5,
-                ),
-                flush=True,
-            )
-
-            self._next_motion_debug = now + 0.5
-
-
-
-        for side in ("left", "right"):
-            position_error = np.linalg.norm(
-                poses[side][:3, 3]
-                - actual[side][:3, 3]
-            )
-
-            rotation_error = Rotation.from_matrix(
-                actual[side][:3, :3].T
-                @ poses[side][:3, :3]
-            ).magnitude()
-
-            if (
-                position_error > self.config.max_target_lead_m
-                or rotation_error
-                > self.config.max_target_rotation_rad
-            ):
-                self._initialized = False
-
-                raise RuntimeError(
-                    f"{side} target is too far from the actual pose. "
-                    "Check robot tracking and reinitialize."
-                )
-
-        return self.mapper(poses, grippers)
+        if calibrate:
+            self.calibrate()
 
     def calibrate(self):
-        pass
+        """터미널 안내에 따라 마우스를 왼팔/오른팔에 매핑하고 축을 맞춘다."""
+        self._calibrations = initialize(self._devices)
 
     def configure(self):
         pass
 
+    def get_action(self):
+        if not self.is_calibrated:
+            raise RuntimeError("Call connect() and calibrate() first.")
+
+        twists = {}
+
+        for side in SIDES:
+            state = read_latest(self._devices[self._calibrations[side].path])
+            now = time.perf_counter()
+
+            # report를 처리한 시각이 t이므로 읽은 뒤의 시각과 비교한다.
+            fresh = now - state["t"] <= settings.INPUT_TIMEOUT_S
+            self.raw_axes[side] = np.array([state[axis] for axis in AXES])
+            self.raw_fresh[side] = fresh
+            axes = self.raw_axes[side] if fresh else np.zeros(6)
+            # 락이 걸린 축은 30% 필터 전에 지운다. 그러지 않으면 회전락 중에도 기울기가 가장 큰 축으로
+            # 잡혀 작은 이동 입력을 걸러 낸 뒤, 락이 회전까지 지워 아무것도 안 남는다.
+            axes = apply_lock(axes, self.locks[side])
+            twists[side] = to_base(
+                axes,
+                self._calibrations[side].device_to_base,
+                settings.DEADZONE,
+                settings.AXIS_FILTER_RATIO,
+                settings.TRANSLATION_CURVE_TEMPERATURE,
+                settings.ROTATION_CURVE_TEMPERATURE,
+            )
+
+            for event in self._buttons[side].update(state["buttons"], now):
+                self._handle_button(side, event)
+
+        twists = self.apply_modes(twists)
+        action = {}
+
+        for side in SIDES:
+            action.update({
+                f"{side}_ee.{key}": float(value)
+                for key, value in zip(TWIST_KEYS, twists[side])
+            })
+            action[f"{side}_ee.wrist_only"] = float(self.wrist_only[side])
+            action[f"{side}_gripper.closed"] = float(self.gripper_closed[side])
+
+        action["follow.mode"] = float(ARM_MODES.index(self.arm_mode))
+        return action
+
+    def apply_modes(self, twists):
+        """팔마다 락과 기준 좌표계를 적용한 뒤, 협조 모드면 따르는 팔 입력을 주도 팔 입력으로 바꾼다.
+
+        협조 모드에서 따르는 팔은 주도 팔의 락·좌표계가 적용된 base 기준 입력을 받는다.
+        """
+        result = {}
+
+        for side in SIDES:
+            twist = apply_lock(twists[side], self.locks[side])
+            # 그리퍼 좌표계에서 z축 회전만 들어오면 컨트롤러가 손목(arm_6) 위주로 돌린다.
+            self.wrist_only[side] = (
+                self.frames[side] == "tool" and twist[5] != 0.0 and not np.any(twist[:5])
+            )
+
+            if self.frames[side] == "tool":
+                if self._tool_rotations is None:
+                    raise RuntimeError("그리퍼 좌표계를 쓰려면 send_feedback()으로 그리퍼 자세를 먼저 받아야 합니다.")
+
+                twist = tool_to_base(twist, self._tool_rotations[side])
+
+            result[side] = twist
+
+        # 따르는 팔은 주도 팔의 base 기준 입력을 받으므로 자기 그리퍼 z축 회전이 아니다.
+        if self.arm_mode != "normal":
+            self.wrist_only[SIDES[1 - SIDES.index(self.leader)]] = False
+
+        return apply_arm_mode(result, self.arm_mode, self.leader)
+
+    def _handle_button(self, side, event):
+        if event == COMBO:
+            self.gripper_closed[side] = not self.gripper_closed[side]
+            self.events.emit(GripperChanged(side, self.gripper_closed[side]))
+        elif event == BUTTON0:
+            self.locks[side] = next_mode(LOCK_MODES, self.locks[side])
+            self.emit_modes()
+        elif event == BUTTON1:
+            self.frames[side] = next_mode(FRAMES, self.frames[side])
+            self.emit_modes()
+
+    def handle_key(self, key):
+        """m: 미러링, t: 트래킹. 지금 모드와 같은 키를 다시 누르면 일반으로 돌아간다."""
+        mode = ARM_MODE_KEYS.get(key.lower())
+
+        if mode is None:
+            return
+
+        self.arm_mode = "normal" if self.arm_mode == mode else mode
+        self.emit_modes()
+
+    def emit_modes(self):
+        self.events.emit(ModeChanged(dict(self.locks), dict(self.frames), self.arm_mode, self.leader))
+
+    def emit_state(self):
+        """현재 모드와 그리퍼 상태를 모두 알린다. (시작할 때 UI 초기화용)"""
+        self.emit_modes()
+
+        for side in SIDES:
+            self.events.emit(GripperChanged(side, self.gripper_closed[side]))
+
     def send_feedback(self, feedback):
-        if not self.is_connected:
-            raise RuntimeError("Teleoperator is not connected.")
+        self._tool_rotations = {
+            side: Rotation.from_rotvec(
+                [feedback[f"{side}_ee.{key}"] for key in ROTVEC_KEYS]
+            ).as_matrix()
+            for side in SIDES
+        }
 
     def disconnect(self):
         try:
@@ -342,80 +248,5 @@ class SpaceMouse4Rby1(Teleoperator):
                 self._stack.close()
         finally:
             self._stack = None
-            self._follower = None
-            self._initialized = False
-            self._wait_neutral = True
-            self._last_update = None
-
-
-def install_lerobot_bridge():
-    """표준 LeRobot 루프 시작 시 이 teleoperator에 robot을 연결한다."""
-    specs = (
-        (
-            "lerobot.scripts.lerobot_teleoperate",
-            "teleop_loop",
-            1,
-            0,
-        ),
-        (
-            "lerobot.scripts.lerobot_record",
-            "record_loop",
-            0,
-            7,
-        ),
-    )
-
-    def wrap_loop(original, robot_position, teleop_position):
-        @wraps(original)
-        def bridged(*args, **kwargs):
-            robot = (
-                kwargs["robot"]
-                if "robot" in kwargs
-                else args[robot_position]
-            )
-
-            teleop = (
-                kwargs["teleop"]
-                if "teleop" in kwargs
-                else args[teleop_position]
-                if len(args) > teleop_position
-                else None
-            )
-
-            if isinstance(teleop, SpaceMouse4Rby1):
-                teleop.bind_robot(robot)
-
-            return original(*args, **kwargs)
-
-        bridged._spacemouse4rby1_bridge = True
-        return bridged
-
-    for (
-        module_name,
-        function_name,
-        robot_position,
-        teleop_position,
-    ) in specs:
-        module = sys.modules.get(module_name)
-
-        if module is None:
-            continue
-
-        original = getattr(module, function_name, None)
-
-        if original is None or getattr(
-            original,
-            "_spacemouse4rby1_bridge",
-            False,
-        ):
-            continue
-
-        setattr(
-            module,
-            function_name,
-            wrap_loop(
-                original,
-                robot_position,
-                teleop_position,
-            ),
-        )
+            self._devices = {}
+            self._calibrations = None

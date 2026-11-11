@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "b8978fd2-1dad-4e11-8c41-d4676a19a9b9",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/home/rainbow/rby1_3d_mouse_teleop/.archify/architecture-teleop-20261111-131701/candidate.json",
+  "output": "/home/rainbow/rby1_3d_mouse_teleop/docs/architecture.html",
+  "specification": {
+    "sha256": "566a3581636e283e0048f011943daec7666da68db273b6e15205950942b35fe4",
+    "bytes": 6941
+  },
+  "artifact": {
+    "sha256": "497c06e3fcfdd9ed6afb4b43833fc4bef4097d4e4e3c30ff14524d02d814b078",
+    "bytes": 860580
+  }
+}

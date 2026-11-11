@@ -15,6 +15,7 @@ dependencies = [
     "pyspacemouse==2.1.0",
     "numpy>=2.0.0,<2.3.0",
     "scipy>=1.14.0,<2.0.0",
+    "pyyaml>=6.0,<7",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,21 @@ dependencies = [
 cli = [
     "lerobot[core_scripts]>=0.6.0,<0.7.0",
 ]
+# tests/view_mouse_frame.py의 3D 뷰어에 사용
+viz = [
+    "matplotlib>=3.9,<4",
+    "PyQt6>=6.7,<7",
+]
+# rby1-spacemouse-teleop의 모니터 창에 사용
+ui = [
+    "PySide6>=6.7,<7",
+]
+
+[project.scripts]
+rby1-spacemouse-teleop = "lerobot_teleoperator_spacemouse4rby1.main:main"
+
+[tool.setuptools.package-data]
+lerobot_teleoperator_spacemouse4rby1 = ["settings.yaml", "model/*.obj"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
