@@ -246,7 +246,7 @@ python tests/view_mouse_frame.py
 | `ready_pose_deg` | 레디자세 (torso, right_arm, left_arm) [deg]. 지금은 샘플 레디자세(책상 740 mm용) |
 | `linear_velocity` / `angular_velocity` | 속도 한도 [m/s] / [rad/s]. 마우스를 끝까지 밀었을 때의 속도 |
 | `singularity_sigma_min` | 특이점 가드 기준(TCP 자코비안 최소 특이값). 0이면 끔. 아직 미완성이라 기본은 0 |
-| `command_minimum_time_s` | 스트림 명령 하나가 목표까지 가는 최소 시간 [s]. 제어 주기(0.01)보다 커야 함. 짧으면 천천히 밀 때 끊기고, 길면 반응이 늦음 (기본 0.05) |
+| `command_minimum_time_s` | 스트림 명령 하나가 목표까지 가는 최소 시간 [s]. 제어 주기(0.01)보다 커야 함. 짧으면 천천히 밀 때 끊기고, 길면 반응이 늦음 (기본 0.1) |
 | `align_velocity` | 축 정렬(x, y, z 키)로 따르는 팔이 움직이는 속도 [m/s]. 0보다 크고 `linear_velocity` 이하 (기본 0.03) |
 | `tcp_offset_m` | 역기구학 기준점(TCP). 그리퍼 몸통 좌표계 기준 [m]. 기본은 두 손가락 끝 사이 `[0, 0, -0.133]` |
 | `arm_stiffness` 등 | 임피던스 제어 관절 게인 |
