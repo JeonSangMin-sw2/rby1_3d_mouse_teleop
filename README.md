@@ -57,10 +57,16 @@ source .venv/bin/activate
 pip install -e ".[viz,ui]"
 ```
 
-- `[viz]`: 3D 뷰어에 쓰는 `matplotlib`, `PyQt6`를 함께 설치합니다.
-  `PyQt6`가 있으면 시스템 Python에 `tkinter`가 없어도 창을
-  띄울 수 있습니다.
+- `[viz]`: 3D 뷰어에 쓰는 `matplotlib`, `PySide6`를 함께 설치합니다.
+  matplotlib가 `PySide6`로 창을 띄우므로 시스템 Python에 `tkinter`가 없어도 됩니다.
 - `[ui]`: 텔레옵 모니터 창에 쓰는 `PySide6`를 설치합니다.
+- Jetson 같은 aarch64 PC에서는 PyPI의 `PySide6` 휠이 glibc 2.39 이상용뿐이라
+  (Ubuntu 22.04는 2.35) pip 설치가 소스 빌드로 넘어가 실패합니다.
+  이때는 conda-forge에서 먼저 설치한 뒤 위 명령을 실행합니다.
+
+  ```bash
+  conda install -c conda-forge pyside6
+  ```
 - 설치하면 가상환경에 `rby1-spacemouse-teleop` 명령이 생깁니다.
 
 설치 확인:

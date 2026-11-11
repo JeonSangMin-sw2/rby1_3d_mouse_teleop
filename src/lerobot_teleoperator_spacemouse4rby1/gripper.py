@@ -20,6 +20,8 @@ BAUD_RATE = 2_000_000
 HOMING_TORQUE = 0.3
 HOLD_TORQUE = 5.0
 LOOP_PERIOD_S = 0.1
+HOMING_STILL_COUNT = 30  # 한 방향으로 밀다가 엔코더가 멈춘 주기가 이만큼 쌓이면 끝으로 본다 (35번 예제 값)
+HOMING_TIMEOUT_S = 15.0  # 한 방향 homing이 이 시간 안에 안 끝나면 오류로 멈춘다
 
 
 class Gripper:
@@ -42,8 +44,8 @@ class Gripper:
         if not self._bus.open_port():
             raise RuntimeError(f"그리퍼 포트를 열지 못했습니다: {upc.GripperDeviceName}")
 
-        upc.initialize_device(upc.GripperDeviceName)
-
+        # upc.initialize_device(latency timer 설정)는 부르지 않는다. 35번 예제처럼 열자마자 baud rate를 맞춘다.
+        # (포트를 연 뒤에 부르던 코드를 뺐다. 20번 예제는 open_port 전에 부른다.)
         if not self._bus.set_baud_rate(BAUD_RATE):
             raise RuntimeError("그리퍼 baud rate를 설정하지 못했습니다.")
 
@@ -72,15 +74,26 @@ class Gripper:
         self._bus.group_sync_write_torque_enable([(i, 1) for i in self._ids])
 
     def _home(self):
-        """양 방향으로 밀어 엔코더가 30번 연속 멈추면 그 끝을 이동 범위로 삼는다."""
+        """양 방향으로 밀어 엔코더가 멈춘 주기가 HOMING_STILL_COUNT번 쌓이면 그 끝을 이동 범위로 삼는다.
+
+        35번 예제처럼 멈춘 주기를 누적으로 센다. 연속으로 세면 끝에 눌린 채 엔코더가 흔들릴 때 끝나지 않는다.
+        """
         self._set_mode(rby.DynamixelBus.CurrentControlMode)
         q = np.zeros(len(self._ids))
 
         for direction in (1.0, -1.0):
             previous = None
             still = 0
+            deadline = time.monotonic() + HOMING_TIMEOUT_S
 
-            while still < 30:
+            while still < HOMING_STILL_COUNT:
+                if time.monotonic() > deadline:
+                    self._bus.group_sync_write_send_torque([(i, 0.0) for i in self._ids])
+                    raise RuntimeError(
+                        f"그리퍼 homing이 {HOMING_TIMEOUT_S:.0f}초 안에 끝나지 않았습니다 "
+                        f"(방향 {direction:+.0f}, 엔코더 {q.round(3).tolist()})."
+                    )
+
                 self._bus.group_sync_write_send_torque(
                     [(i, HOMING_TORQUE * direction) for i in self._ids]
                 )
@@ -92,7 +105,10 @@ class Gripper:
 
                 self._min_q = np.minimum(self._min_q, q)
                 self._max_q = np.maximum(self._max_q, q)
-                still = still + 1 if previous is not None and np.array_equal(previous, q) else 0
+
+                if previous is not None and np.array_equal(previous, q):
+                    still += 1
+
                 previous = q.copy()
                 time.sleep(0.1)
 
@@ -129,10 +145,10 @@ class Gripper:
             self._thread = None
 
         if self._bus is not None:
+            # DynamixelBus(SDK 0.10)에는 close_port가 없다. 토크만 끄고 객체를 놓는다.
             try:
                 self._bus.group_sync_write_torque_enable([(i, 0) for i in self._ids])
             finally:
-                self._bus.close_port()
                 self._bus = None
 
 
