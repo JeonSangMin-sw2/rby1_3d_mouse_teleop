@@ -449,3 +449,239 @@ python tests/sim_controller_check.py --help
 - [rby1-lerobot](https://github.com/RainbowRobotics/rby1-lerobot)
 - [rby1-sdk](https://github.com/RainbowRobotics/rby1-sdk)
 - [PySpaceMouse](https://spacemouse.kubaandrysek.cz/)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+(lerobot) nvidia@tegra-ubuntu:~/sy_ws/rby1_3d_mouse_teleop$ pip install -e ".[viz,ui]"
+Obtaining file:///home/nvidia/sy_ws/rby1_3d_mouse_teleop
+  Installing build dependencies ... done
+  Checking if build backend supports build_editable ... done
+  Getting requirements to build editable ... done
+  Preparing editable metadata (pyproject.toml) ... done
+Requirement already satisfied: lerobot<0.7.0,>=0.5.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (0.6.2)
+Requirement already satisfied: rby1-sdk in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (0.10.0)
+Requirement already satisfied: pyspacemouse==2.1.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (2.1.0)
+Requirement already satisfied: numpy<2.3.0,>=2.0.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (2.2.6)
+Requirement already satisfied: scipy<2.0.0,>=1.14.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (1.18.0)
+Requirement already satisfied: pyyaml<7,>=6.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (6.0.3)
+Requirement already satisfied: matplotlib<4,>=3.9 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (3.11.1)
+Collecting PyQt6<7,>=6.7 (from lerobot_teleoperator_spacemouse4rby1==0.1.0)
+  Downloading pyqt6-6.12.0.tar.gz (1.1 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.1/1.1 MB 18.6 MB/s  0:00:00
+  Installing build dependencies ... done
+  Getting requirements to build wheel ... done
+  Preparing metadata (pyproject.toml) ... error
+  error: subprocess-exited-with-error
+  
+  × Preparing metadata (pyproject.toml) did not run successfully.
+  │ exit code: 1
+  ╰─> [25 lines of output]
+      Traceback (most recent call last):
+        File "/home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>
+          main()
+        File "/home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 373, in main
+          json_out["return_val"] = hook(**hook_input["kwargs"])
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 178, in prepare_metadata_for_build_wheel
+          whl_basename = backend.build_wheel(metadata_directory, config_settings)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/sipbuild/api.py", line 28, in build_wheel
+          project = AbstractProject.bootstrap('wheel',
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/sipbuild/abstract_project.py", line 74, in bootstrap
+          project.setup(pyproject, tool, tool_description)
+        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/sipbuild/project.py", line 708, in setup
+          self.apply_user_defaults(tool)
+        File "/tmp/pip-install-98qdx9ei/pyqt6_1e8d85bca5494a84b7650a2dea811062/project.py", line 62, in apply_user_defaults
+          super().apply_user_defaults(tool)
+        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/pyqtbuild/project.py", line 51, in apply_user_defaults
+          super().apply_user_defaults(tool)
+        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/sipbuild/project.py", line 264, in apply_user_defaults
+          self.builder.apply_user_defaults(tool)
+        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/pyqtbuild/builder.py", line 49, in apply_user_defaults
+          raise PyProjectOptionException('qmake',
+      sipbuild.pyproject.PyProjectOptionException
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+error: metadata-generation-failed
+
+× Encountered error while generating package metadata.
+╰─> PyQt6
+
+note: This is an issue with the package mentioned above, not pip.
+hint: See above for details.
+(lerobot) nvidia@tegra-ubuntu:~/sy_ws/rby1_3d_mouse_teleop$
+
+The installation is failing specifically because PyQt6 is being built from source, but the Qt build tool qmake is missing.
+
+The important error is:
+text
+
+sipbuild.pyproject.PyProjectOptionException: qmake
+
+This is not a problem with LeRobot, your SpaceMouse code, or pip itself.
+
+Your environment is Python 3.12 on an NVIDIA Tegra/Jetson system. PyQt6 is trying to compile instead of installing a prebuilt wheel.
+1. Recommended fix: Install Qt development dependencies
+
+First, install the system-level Qt tools:
+bash
+
+sudo apt update
+sudo apt install -y qt6-base-dev qt6-base-dev-tools qt6-tools-dev-tools
+
+Check whether qmake is available:
+bash
+
+which qmake6
+which qmake
+
+If qmake6 exists, try:
+bash
+
+export PATH=/usr/lib/qt6/bin:$PATH
+
+2. Retry the installation
+
+After installing Qt dependencies:
+bash
+
+cd ~/sy_ws/rby1_3d_mouse_teleop
+
+python -m pip install --upgrade pip setuptools wheel
+
+pip install -e ".[viz,ui]"
+
+3. If it still fails
+
+Check Qt installation:
+bash
+
+qmake6 -query
+
+If qmake6 works but qmake is not found:
+bash
+
+sudo ln -s /usr/lib/qt6/bin/qmake /usr/local/bin/qmake
+
+Then retry:
+bash
+
+pip install -e ".[viz,ui]"
+
+4. Alternative: Skip the UI dependency
+
+If you only need visualization and don't need the PyQt6-based UI, try:
+bash
+
+pip install -e ".[viz]"
+
+This avoids installing the ui extra and its PyQt6 dependency.
+
+One question about your hardware: Which NVIDIA Jetson are you using?
+
+    Jetson Orin Nano
+
+    Jetson Orin NX
+
+    Jetson AGX Orin
+
+    Jetson Xavier
+
+    Other
+
+The exact PyQt6 installation approach can differ depending on the JetPack/Ubuntu version and ARM64 environment.
+This might also interest you.
+Learn more
+MCP1
+One URL for your MCPs
+Connect MCP servers to Claude, Cursor and Codex.
+Ad
+
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+lerobot 0.6.2 requires setuptools<82.0.0,>=71.0.0, but you have setuptools 84.2.1 which is incompatible.
+torch 2.11.0 requires setuptools<82, but you have setuptools 84.2.1 which is incompatible.
+Successfully installed pip-26.3 setuptools-84.2.1
+Obtaining file:///home/nvidia/sy_ws/rby1_3d_mouse_teleop
+  Installing build dependencies ... done
+  Checking if build backend supports build_editable ... done
+  Getting requirements to build editable ... done
+  Preparing editable metadata (pyproject.toml) ... done
+Requirement already satisfied: lerobot<0.7.0,>=0.5.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (0.6.2)
+Requirement already satisfied: rby1-sdk in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (0.10.0)
+Requirement already satisfied: pyspacemouse==2.1.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (2.1.0)
+Requirement already satisfied: numpy<2.3.0,>=2.0.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (2.2.6)
+Requirement already satisfied: scipy<2.0.0,>=1.14.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (1.18.0)
+Requirement already satisfied: pyyaml<7,>=6.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (6.0.3)
+
+You now have a second issue: setuptools 84.2.1 is incompatible with both LeRobot 0.6.2 and PyTorch 2.11.0.
+
+Both packages require:
+text
+
+setuptools < 82
+
+The fix is straightforward. Downgrade setuptools to a compatible version.
+1. Fix setuptools
+
+Inside your existing (lerobot) environment, run:
+bash
+
+pip install "setuptools>=71,<82"
+
+I recommend pinning it to 81.0.0:
+bash
+
+pip install setuptools==81.0.0
+
+2. Verify the environment
+bash
+
+python -c "import setuptools; print(setuptools.__version__)"
+
+Expected:
+text
+
+81.0.0
+
+Check package consistency:
+bash
+
+pip check
+
+3. Retry your installation
+bash
+
+cd ~/sy_ws/rby1_3d_mouse_teleop
+
+pip install -e ".[viz,ui]"
+
+Important
+
+For your LeRobot environment, avoid upgrading setuptools to version 82 or higher because:
+
+    LeRobot 0.6.2 requires setuptools below 82.
+
+    PyTorch 2.11.0 requires setuptools below 82.
+
+My recommendation: Keep setuptools pinned at 81.0.0 in this environment to avoid breaking existing dependencies.
+
+If pip check reports additional conflicts, share its output before upgrading or reinstalling other packages.
+
