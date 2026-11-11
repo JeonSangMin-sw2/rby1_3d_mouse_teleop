@@ -5,7 +5,7 @@
 robot_address: "127.0.0.1:50051"
 
 # 임피던스 활성화 여부. true면 Cartesian 임피던스 제어, false면 Cartesian 위치 제어
-impedance_enabled: false
+impedance_enabled: true
 
 # unlimit 사용 여부. true면 control manager를 unlimited mode로 켠다. (켤 때 관절 범위를 검사하지 않는다)
 unlimited_mode: false
@@ -40,6 +40,10 @@ angular_velocity: 0.5 # [rad/s]
 linear_acceleration: 1.0 # [m/s^2] 임피던스 제어에서 사용
 angular_acceleration: 4.0 # [rad/s^2] 임피던스 제어에서 사용
 acceleration_limit_scaling: 0.8 # 0~1, 위치 제어에서 사용
+# 스트림 명령 하나가 목표까지 가는 최소 시간 [s]. 제어 주기(0.01)보다 길어야 한다.
+# 짧으면 천천히 밀 때 명령마다 목표에 닿아 멈췄다 출발해 끊기고, 길면 반응이 그만큼 늦어진다.
+# 마우스 값이 바뀌는 간격(블루투스 기록: 중앙값 18 ms, 95% 40 ms)보다 길게 둔다.
+command_minimum_time_s: 0.05
 # 축 정렬(키보드 x, y, z)로 따르는 팔이 움직이는 속도 [m/s]. 0보다 크고 linear_velocity 이하.
 align_velocity: 0.03
 
@@ -59,6 +63,12 @@ max_target_lead_rad: 0.35
 collision_distance_m: 0.01
 # 막힌 뒤에는 이 거리만큼 더 멀어져야 풀린다. (경계에서 막힘/풀림 반복 방지)
 collision_release_margin_m: 0.005
+
+# 특이점 가드 기준. 팔 TCP 자코비안([선속도 m; 각속도 rad] / rad)의 최소 특이값이 이보다 작으면 경고하고,
+# 그 팔은 특이점 쪽으로 더 들어가는 입력을 막고 앞선 목표를 버린다(빠져나오는 방향은 허용). 0이면 끈다.
+# 아직 미완성이라 꺼 둔다: 시뮬레이터에서 위로 끝까지 밀면 0.06으로 켜도 Singularity로 멈췄다.
+# (가드 없이 멈춘 지점의 최소 특이값: 위 +z 0.031, 회전 rx 0.018)
+singularity_sigma_min: 0.0
 
 # 메인 팔. 트래킹·미러링(키보드 t, m)에서 주도하는 팔이고, 높이 맞춤(키보드 z)의 기준 팔이다. right 또는 left.
 # 트래킹·미러링에서 따르는 팔의 마우스 이동 입력은 무시한다.

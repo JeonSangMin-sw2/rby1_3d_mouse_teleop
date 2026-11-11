@@ -14,6 +14,12 @@
     python tests/sim_controller_check.py align       # 왼팔 x·y(대칭)·z를 오른팔에 맞추는지, 왼팔 마우스 입력으로 취소되는지 (x, y, z 키)
     python tests/sim_controller_check.py follow      # 팔로우에서 오른팔이 못 가면 왼팔도 멈추는지 (m, t 키)
     python tests/sim_controller_check.py reinit      # 팔을 끝까지 뻗어 제어가 멈추게 한 뒤 재초기화로 다시 조작되는지 (i 키)
+    python tests/sim_controller_check.py smooth      # 천천히 밀 때 실제 속도가 고른지 (끊김), 제어 주기가 들쭉날쭉할 때도
+    python tests/sim_controller_check.py singular    # 여러 방향으로 끝까지 밀 때 특이점 가드가 멈춤(fault)을 막고 반대로는 빠지는지
+                                                     # --singularity 0이면 가드를 끄고 멈추는 지점의 최소 특이값을 잰다
+    python tests/sim_controller_check.py limitinfo   # 레디자세에서 아래로 밀 때 막는 관절 한도를 로그로 알려 주는지
+
+--min-time으로 command_minimum_time_s를 바꿔 같은 입력으로 비교한다.
 
 --variant로 설정 하나만 바꿔 같은 입력으로 비교한다.
 """
@@ -25,7 +31,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from lerobot_teleoperator_spacemouse4rby1 import settings
-from lerobot_teleoperator_spacemouse4rby1.events import CollisionChanged, EventBus, LogMessage
+from lerobot_teleoperator_spacemouse4rby1.events import CollisionChanged, EventBus, LogMessage, SingularityChanged
 from lerobot_teleoperator_spacemouse4rby1.mouse import mirror, tool_to_base
 from lerobot_teleoperator_spacemouse4rby1.robot import Rby1Controller, RobotStopped
 
@@ -366,6 +372,105 @@ def check_reinit(robot):
     )
 
 
+def check_smooth(robot):
+    """앞 +x로 일정하게 천천히(입력 0.3) 3초 밀며 매 주기 실제 TCP 속도를 잰다.
+
+    제어 주기가 일정할 때와, 무작위로 0~15 ms 늦을 때(느린 PC 흉내)를 비교한다.
+    끊김은 평균 속도의 20% 아래로 떨어진 주기 비율로 본다.
+    """
+    rng = np.random.default_rng(0)
+
+    for name, jitter in (("주기 일정", 0.0), ("주기 0~15 ms 늦음", 0.015)):
+        robot.return_to_ready()
+        run(robot, (0,) * 6, 0.3)
+        positions, times = [], []
+        end = time.perf_counter() + 3.0
+
+        while time.perf_counter() < end:
+            robot.send_action(action((0.3, 0, 0, 0, 0, 0)))
+            positions.append(robot._actual["right"][0, 3])
+            times.append(time.perf_counter())
+            time.sleep(settings.CONTROL_PERIOD_S + rng.uniform(0.0, jitter))
+
+        # 출발 1초 뒤부터 본다.
+        positions, times = np.array(positions), np.array(times)
+        keep = times > times[0] + 1.0
+        speed = np.diff(positions[keep]) / np.diff(times[keep])
+        mean = speed.mean()
+        print(
+            f"{name}: 평균 {mean * 1000:.1f} mm/s, 표준편차/평균 {speed.std() / mean:.2f}, "
+            f"평균의 20% 아래로 떨어진 주기 {100 * np.mean(speed < 0.2 * mean):.0f}% ({len(speed)}주기)"
+        )
+
+
+SINGULAR_CASES = (
+    ("앞 +x", (1, 0, 0, 0, 0, 0)),
+    ("앞+위", (1, 0, 0.5, 0, 0, 0)),
+    ("위 +z", (0, 0, 1, 0, 0, 0)),
+    ("아래 -z", (0, 0, -1, 0, 0, 0)),
+    ("바깥 -y", (0, -1, 0, 0, 0, 0)),
+    ("뒤 -x", (-1, 0, 0, 0, 0, 0)),
+    ("앞+바깥", (1, -1, 0, 0, 0, 0)),
+    ("회전 rx", (0, 0, 0, 1, 0, 0)),
+    ("회전 ry", (0, 0, 0, 0, 1, 0)),
+)
+
+
+def check_singular(robot, logs):
+    """오른팔을 방향마다 12초 밀어 로봇이 Singularity로 멈추는지와 그때까지의 최소 특이값을 본다.
+
+    멈추지 않았으면 반대로 1.5초 밀어 빠져나오는지(움직인 거리·각도)도 본다.
+    """
+    for name, twist in SINGULAR_CASES:
+        robot.return_to_ready()
+        logs.clear()
+        sigma_min = np.inf
+        stopped = None
+        end = time.perf_counter() + 12.0
+
+        try:
+            while time.perf_counter() < end:
+                robot.send_action(action(twist))
+                sigma_min = min(sigma_min, robot._sigma["right"])
+                time.sleep(settings.CONTROL_PERIOD_S)
+        except RobotStopped as exc:
+            stopped = exc
+
+        if stopped is not None:
+            print(f"{name}: 멈춤 ({stopped}), 그때까지 최소 특이값 {sigma_min:.4f}")
+            robot.reinitialize()
+            continue
+
+        before = robot._read_poses()[0]["right"]
+        run(robot, tuple(-v for v in twist), 1.5)
+        after = robot._read_poses()[0]["right"]
+        turned = np.degrees(np.linalg.norm(Rotation.from_matrix(after[:3, :3] @ before[:3, :3].T).as_rotvec()))
+        warned = any("특이점 근접" in text for text in logs)
+        print(
+            f"{name}: 멈추지 않음, 최소 특이값 {sigma_min:.4f}, 가드 경고 {'있음' if warned else '없음'} → "
+            f"반대로 1.5초 {np.linalg.norm(after[:3, 3] - before[:3, 3]) * 1000:.0f} mm / {turned:.1f}°"
+        )
+
+
+def check_limit_info(robot, logs):
+    """레디자세에서 오른팔·왼팔을 아래(-z)로 4초 밀고, 관절 한도 안내 로그를 출력한다."""
+    logs.clear()
+    start = robot._read_poses()[0]
+    run_both = time.perf_counter() + 4.0
+
+    while time.perf_counter() < run_both:
+        robot.send_action(action((0, 0, -1, 0, 0, 0), left=(0, 0, -1, 0, 0, 0)))
+        time.sleep(settings.CONTROL_PERIOD_S)
+
+    end = robot._read_poses()[0]
+
+    for side in ("right", "left"):
+        print(f"{side}: 아래로 {(start[side][2, 3] - end[side][2, 3]) * 1000:.0f} mm")
+
+    for text in logs:
+        print(f"  로그: {text}")
+
+
 def apply_variant(variant):
     if variant == "accel":
         settings.LINEAR_ACCELERATION, settings.ANGULAR_ACCELERATION = 150.0, 80 * np.pi
@@ -388,7 +493,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "scenario",
-        choices=("collision", "limits", "response", "reach", "tcp", "ready", "toolz", "wristswitch", "release", "align", "follow", "reinit"),
+        choices=("collision", "limits", "response", "reach", "tcp", "ready", "toolz", "wristswitch", "release", "align", "follow", "reinit", "smooth", "singular", "limitinfo"),
     )
     parser.add_argument(
         "--variant",
@@ -402,7 +507,15 @@ def main():
         choices=("on", "off"),
         help="yaml의 impedance_enabled 대신 임피던스 제어를 켜거나 끈다. (noelbow, stiff, accel은 임피던스에서만 의미 있음)",
     )
+    parser.add_argument("--min-time", type=float, help="yaml의 command_minimum_time_s 대신 쓸 값 [s]")
+    parser.add_argument("--singularity", type=float, help="yaml의 singularity_sigma_min 대신 쓸 값 (0이면 가드 끔)")
     args = parser.parse_args()
+
+    if args.singularity is not None:
+        settings.SINGULARITY_SIGMA_MIN = args.singularity
+
+    if args.min_time is not None:
+        settings.COMMAND_MINIMUM_TIME_S = args.min_time
 
     if args.impedance is not None:
         settings.IMPEDANCE_ENABLED = args.impedance == "on"
@@ -417,12 +530,19 @@ def main():
     events.subscribe(lambda e: collisions.append(e) if isinstance(e, CollisionChanged) else None)
     logs = []
     events.subscribe(lambda e: logs.append(e.text) if isinstance(e, LogMessage) else None)
+    events.subscribe(
+        lambda e: logs.append(f"특이점 {'근접' if e.near else '해제'} {e.side} σ={e.sigma:.4f}")
+        if isinstance(e, SingularityChanged) else None
+    )
 
     robot = Rby1Controller(events)
     robot.connect()
 
     control = "임피던스" if settings.IMPEDANCE_ENABLED else "위치 제어"
-    print(f"[{args.scenario} / {args.variant} / {control}, 직선 속도 {settings.LINEAR_VELOCITY} m/s]")
+    print(
+        f"[{args.scenario} / {args.variant} / {control}, 직선 속도 {settings.LINEAR_VELOCITY} m/s, "
+        f"minimum time {settings.COMMAND_MINIMUM_TIME_S} s]"
+    )
 
     try:
         {
@@ -438,6 +558,9 @@ def main():
             "align": lambda: check_align(robot, logs),
             "follow": lambda: check_follow(robot),
             "reinit": lambda: check_reinit(robot),
+            "smooth": lambda: check_smooth(robot),
+            "singular": lambda: check_singular(robot, logs),
+            "limitinfo": lambda: check_limit_info(robot, logs),
         }[args.scenario]()
     except RuntimeError as exc:
         print(f"중단: {exc}")

@@ -44,6 +44,7 @@ def _side_header(side):
         + [f"{side}_actual_{key}" for key in POSE_KEYS]
         + [f"{side}_q{index}_deg" for index in range(7)]
         + [f"{side}_lock", f"{side}_frame", f"{side}_gripper_closed"]
+        + [f"{side}_sigma_min"]
     )
 
 
@@ -96,6 +97,7 @@ class RunLog:
             row += [f"{v:.5f}" for v in _pose_values(cycle["actuals"][side])]
             row += [f"{v:.2f}" for v in np.rad2deg(cycle["arm_q"][side])]
             row += [teleop.locks[side], teleop.frames[side], int(teleop.gripper_closed[side])]
+            row.append(f"{cycle['sigma'][side]:.4f}")
 
         row.append(" | ".join(events))
         self._writer.writerow(row)

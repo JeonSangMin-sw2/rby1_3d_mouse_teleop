@@ -7,16 +7,18 @@ send_action()은 SpaceMouse4Rby1.get_action()의 twist를 적분해 팔마다 EE
 상대 링크에서 멀어지는 이동만 허용한다(회전은 막는다).
 """
 
+import itertools
 import re
 import time
 from contextlib import suppress
 
 import numpy as np
 import rby1_sdk as rby
+from scipy.optimize import linprog
 from scipy.spatial.transform import Rotation
 
 from . import settings
-from .events import CollisionChanged, LogMessage, StatusUpdated
+from .events import CollisionChanged, LogMessage, SingularityChanged, StatusUpdated
 from .mouse import ARM_MODES, mirror
 
 SIDES = ("right", "left")
@@ -35,6 +37,12 @@ STATUS_PERIOD_S = 0.1
 COLLISION_QUERY_COUNT = 5
 ALIGN_TOLERANCE_M = 1e-4  # 정렬 목표가 이만큼 가까워지면 끝낸다.
 ALIGN_AXES = {"x": "앞뒤(x)", "y": "좌우(y)", "z": "높이(z)"}
+SINGULARITY_RELEASE_RATIO = 1.2  # 특이점 근접은 최소 특이값이 기준의 이 배수를 넘어야 풀린다 (경계에서 반복 방지)
+SINGULARITY_PROBE_M = 0.002  # 특이점 쪽 방향을 볼 때 TCP를 움직여 보는 크기 (이동)
+SINGULARITY_PROBE_RAD = 0.01  # 같은 용도 (회전)
+JOINT_LIMIT_NEAR_RAD = np.radians(5.0)  # 한도 안내: 한도까지 이만큼 안쪽인 관절을 "한도 근처"로 본다
+STALL_S = 0.3  # 목표가 선행 한도까지 앞선 채 이만큼 지나면 관절 한도 때문인지 본다
+STALL_RECHECK_S = 0.5
 FOLLOW_HOLD_LOG_M = 0.002  # 따르는 팔 때문에 메인 팔 목표가 이만큼 넘게 줄면 로그를 남긴다 (한 번 밀 때 한 번)
 
 
@@ -137,6 +145,59 @@ def arm_of_link(link):
     return None
 
 
+def tcp_jacobian(body_jacobian, ee_pose, tcp_offset):
+    """SDK body 자코비안([ee 각속도; ee 원점 속도], ee 좌표계)을 TCP 점, base 방향의 [선속도; 각속도]로 바꾼다.
+
+    twist와 같은 기준이라 특이값·방향을 입력과 바로 비교할 수 있다.
+    """
+    rotation = ee_pose[:3, :3]
+    angular = rotation @ body_jacobian[:3]
+    offset = rotation @ np.asarray(tcp_offset, dtype=float)
+    # TCP 속도 = ee 원점 속도 + 각속도 × (ee 원점 → TCP)
+    linear = rotation @ body_jacobian[3:] + np.cross(angular.T, offset).T
+    return np.vstack([linear, angular])
+
+
+def remove_toward(velocity, direction):
+    """velocity [선속도, 각속도]에서 direction(단위 벡터) 쪽으로 가는 성분만 지운다. 반대쪽은 그대로 둔다."""
+    velocity = np.asarray(velocity, dtype=float)
+    along = float(np.dot(velocity, direction))
+    return velocity - along * direction if along > 0.0 else velocity
+
+
+def blocking_joints(jacobian, velocity, q, lower, upper, margin):
+    """velocity로 가려면 한도까지 margin 안쪽인 관절이 한도 쪽으로 가야 해서 못 가는지 본다.
+
+    못 가면 그렇게 막는 가장 작은 관절 묶음(팔 관절 번호)을, 갈 수 있으면 빈 목록을 반환한다.
+    한도 근처 관절은 한도 반대쪽으로만 움직일 수 있다고 두고 J·dq = velocity를 만족하는 dq가 있는지 푼다.
+    """
+    # 관절 속도 범위(±1)에 들어오도록 크기를 작게 맞춘다. 방향만 본다.
+    velocity = np.asarray(velocity, dtype=float)
+    velocity = velocity / np.linalg.norm(velocity) * 1e-3
+    near = {}
+
+    for joint in range(len(q)):
+        if upper[joint] - q[joint] < margin:
+            near[joint] = (-1.0, 0.0)
+        elif q[joint] - lower[joint] < margin:
+            near[joint] = (0.0, 1.0)
+
+    def feasible(limited):
+        bounds = [near[j] if j in limited else (-1.0, 1.0) for j in range(len(q))]
+        result = linprog(np.zeros(len(q)), A_eq=jacobian, b_eq=velocity, bounds=bounds, method="highs")
+        return result.status == 0
+
+    if not near or feasible(set(near)):
+        return []
+
+    for size in range(1, len(near) + 1):
+        for subset in itertools.combinations(sorted(near), size):
+            if not feasible(set(subset)):
+                return list(subset)
+
+    return sorted(near)
+
+
 def collision_filter(side, twist, pairs):
     """가까운 링크 쌍(pairs)에 걸린 팔의 twist에서 허용되는 부분만 남긴다.
 
@@ -175,6 +236,15 @@ class RobotStopped(RuntimeError):
 
 class Rby1Controller:
     def __init__(self, events, address=settings.ROBOT_ADDRESS):
+        if not settings.SINGULARITY_SIGMA_MIN >= 0.0:
+            raise ValueError(f"singularity_sigma_min은 0 이상이어야 합니다: {settings.SINGULARITY_SIGMA_MIN!r}")
+
+        if not settings.COMMAND_MINIMUM_TIME_S > settings.CONTROL_PERIOD_S:
+            raise ValueError(
+                f"command_minimum_time_s는 제어 주기({settings.CONTROL_PERIOD_S}s)보다 커야 합니다: "
+                f"{settings.COMMAND_MINIMUM_TIME_S!r}"
+            )
+
         # 명령의 속도 한도가 linear_velocity라 그보다 빠른 정렬 속도는 낼 수 없다.
         if not 0.0 < settings.ALIGN_VELOCITY <= settings.LINEAR_VELOCITY:
             raise ValueError(
@@ -202,6 +272,16 @@ class Rby1Controller:
         self._moving = {side: False for side in SIDES}  # 직전 주기에 그 팔 입력이 있었는지
         self._wrist_capped = {side: False for side in SIDES}  # 손목 한도로 회전을 막고 있는지 (로그 한 번만)
         self._wrist_limits = None  # connect()가 채우는 팔별 arm_6 (하한, 상한) [rad]
+        self._arm_limits = None  # connect()가 채우는 팔별 7관절 (하한 배열, 상한 배열) [rad]
+        # 특이점에서 빠져나오는 방향을 볼 때 쓰는 FK 상태. 이번 주기 FK(_fk_state)를 건드리지 않게 따로 둔다.
+        self._probe_state = None
+        self._jacobians = {}  # 이번 주기 팔별 TCP 자코비안 (6×7, [선속도; 각속도], base 방향)
+        self._sigma = {side: np.inf for side in SIDES}  # 이번 주기 TCP 자코비안의 최소 특이값
+        self._singular = {side: False for side in SIDES}
+        self._toward = {side: None for side in SIDES}  # 특이점 근접일 때 특이점 쪽으로 가는 [선속도, 각속도] 단위 방향
+        self._stall_since = {side: None for side in SIDES}
+        self._stall_checked = {side: 0.0 for side in SIDES}
+        self._stall_reported = {side: False for side in SIDES}
         self._actual = None  # 이번 주기에 읽은 실제 TCP 자세
         self._align_goal = {side: None for side in SIDES}  # 정렬 중인 팔의 (축, 목표값 [m], 시작할 때의 목표 자세)
         # 팔로우 기준: 팔로우를 시작할 때의 (메인 팔 실제 자세, 따르는 팔 목표 자세). None이면 다음 주기에 다시 잡는다.
@@ -238,6 +318,13 @@ class Rby1Controller:
         self._wrist_limits = {
             side: (lower[self._arm_idx(side)[6]], upper[self._arm_idx(side)[6]]) for side in SIDES
         }
+        self._arm_limits = {
+            side: (np.asarray(lower)[self._arm_idx(side)], np.asarray(upper)[self._arm_idx(side)]) for side in SIDES
+        }
+        self._probe_state = self._dynamics.make_state(
+            ["base", *EE_LINKS.values(), TORSO_LINK],
+            self._model.robot_joint_names,
+        )
 
         self._power_on()
 
@@ -356,6 +443,11 @@ class Rby1Controller:
                 self._end_align(side, f"{SIDE_NAMES[side]} 충돌 경고로 정렬을 멈춥니다.")
                 return
 
+            # 특이점 쪽 성분을 지우고 나서 맞추는 축 방향이 절반도 안 남으면 그 축으로는 특이점에 들어가는 중이다.
+            if abs(self._guard_singularity(side, direction)[index]) < 0.5:
+                self._end_align(side, f"{SIDE_NAMES[side]} 특이점 근처라 정렬을 멈춥니다.")
+                return
+
             reach = settings.ALIGN_VELOCITY * dt
             value += np.clip(goal - value, -reach, reach)
             value = np.clip(
@@ -443,6 +535,7 @@ class Rby1Controller:
             for index, side in enumerate(SIDES, start=1)
         }
         self._torso = np.array(self._dynamics.compute_transformation(self._fk_state, 0, len(SIDES) + 1))
+        self._jacobians = {side: self._arm_jacobian(self._fk_state, side) for side in SIDES}
         pairs = self._dynamics.detect_collisions_or_nearest_links(
             self._fk_state, COLLISION_QUERY_COUNT
         )
@@ -480,8 +573,10 @@ class Rby1Controller:
                     if any(side in (arm_of_link(p.link1), arm_of_link(p.link2)) for p in near):
                         self._targets[side] = actual[side]
 
+        self._update_singularity()
         linear_speed = settings.LINEAR_VELOCITY
         angular_speed = settings.ANGULAR_VELOCITY
+        scale = np.array([linear_speed] * 3 + [angular_speed] * 3)  # twist(-1~1) → [m/s, rad/s]
         inputs = {}
         arm_mode = ARM_MODES[int(action["follow.mode"])]
         leader = settings.MAIN_ARM
@@ -514,11 +609,13 @@ class Rby1Controller:
                 self._follow_anchor = None
 
             twist = collision_filter(side, twist, near)
+            twist = self._guard_singularity(side, twist * scale) / scale
             inputs[side] = twist
             moving = bool(np.any(twist != 0.0))
             self._wrist_only[side] = moving and action[f"{side}_ee.wrist_only"] > 0.5
 
             if moving:
+                self._drop_lead_toward_singularity(side, actual[side])
                 target = drop_opposing_lead(self._targets[side], actual[side], twist)
                 target = integrate(target, twist, dt, linear_speed, angular_speed)
                 self._targets[side] = clamp_lead(
@@ -533,12 +630,18 @@ class Rby1Controller:
 
                 if self._wrist_only[side]:
                     self._cap_wrist_target(side)
+
+                self._check_stall(side, actual[side], twist * scale)
             elif self._moving[side]:
                 # 손을 뗀 순간 목표를 실제 자세로 맞춰, 앞서 있던 목표까지 더 가지 않고 바로 멈춘다.
                 # 그 뒤로는 이 자세를 계속 목표로 둔다(매 주기 실제 자세로 바꾸면 처지는 만큼 따라 내려간다).
                 self._targets[side] = actual[side].copy()
 
             self._moving[side] = moving
+
+            if not moving:
+                self._stall_since[side] = None
+                self._stall_reported[side] = False
 
             if side == leader and not moving:
                 self._follower_holding = False
@@ -566,6 +669,7 @@ class Rby1Controller:
             },
             "min_distance": min_distance,
             "blocked": blocked,
+            "sigma": dict(self._sigma),
         }
 
         if now - self._last_status >= STATUS_PERIOD_S:
@@ -604,7 +708,8 @@ class Rby1Controller:
             desired[:3, 3] - self._targets[side][:3, 3],
             _rotation_lead(desired, self._targets[side]),
         ])
-        allowed = collision_filter(side, step, near)
+        allowed = self._guard_singularity(side, collision_filter(side, step, near))
+        self._drop_lead_toward_singularity(side, actual[side])
 
         if np.array_equal(allowed, step):
             target = desired
@@ -614,6 +719,106 @@ class Rby1Controller:
         self._targets[side] = clamp_lead(
             target, actual[side], settings.MAX_TARGET_LEAD_M, settings.MAX_TARGET_LEAD_RAD
         )
+
+    def _arm_jacobian(self, state, side):
+        """state의 FK로 그 팔의 TCP 자코비안(6×7)을 만든다. compute_forward_kinematics 뒤에 부른다."""
+        index = SIDES.index(side) + 1
+        ee_pose = np.array(self._dynamics.compute_transformation(state, 0, index))
+        body = np.asarray(self._dynamics.compute_body_jacobian(state, 0, index))[:, self._arm_idx(side)]
+        return tcp_jacobian(body, ee_pose, settings.TCP_OFFSET_M)
+
+    def _update_singularity(self):
+        """팔마다 TCP 자코비안의 최소 특이값을 보고, 기준 아래면 특이점 쪽 방향을 구해 둔다.
+
+        로봇은 특이점에 닿으면 스스로 제어를 끝낸다(Singularity). 그 전에 그쪽 입력만 막아 멈추지 않게 한다.
+        """
+        for side in SIDES:
+            sigma = np.linalg.svd(self._jacobians[side], compute_uv=False)[-1]
+            self._sigma[side] = sigma
+            threshold = settings.SINGULARITY_SIGMA_MIN * (
+                SINGULARITY_RELEASE_RATIO if self._singular[side] else 1.0
+            )
+            near = sigma < threshold
+            self._toward[side] = self._singular_toward(side) if near else None
+
+            if near != self._singular[side]:
+                self._singular[side] = near
+                self.events.emit(SingularityChanged(side, near, float(sigma)))
+
+    def _singular_toward(self, side):
+        """TCP를 움직이면 최소 특이값이 줄어드는 방향([선속도, 각속도] 단위 벡터). 축마다 조금 움직여 본 기울기로 구한다.
+
+        최소 특이값 방향(특이 벡터) 성분만 막으면 나머지 성분으로 계속 특이점에 들어가 멈췄다
+        (시뮬레이터: 위 +z, 회전 rx). 그래서 최소 특이값을 실제로 깎는 방향을 막는다.
+        """
+        inverse = np.linalg.pinv(self._jacobians[side])
+        gradient = np.zeros(6)
+
+        for axis in range(6):
+            step = SINGULARITY_PROBE_M if axis < 3 else SINGULARITY_PROBE_RAD
+            q = self._q.copy()
+            q[self._arm_idx(side)] += inverse[:, axis] * step
+            self._probe_state.set_q(q)
+            self._dynamics.compute_forward_kinematics(self._probe_state)
+            sigma = np.linalg.svd(self._arm_jacobian(self._probe_state, side), compute_uv=False)[-1]
+            gradient[axis] = (sigma - self._sigma[side]) / step
+
+        norm = np.linalg.norm(gradient)
+        return -gradient / norm if norm > 0.0 else None
+
+    def _guard_singularity(self, side, velocity):
+        """특이점 근접이면 velocity [선속도, 각속도]에서 특이점 쪽 성분만 지운다."""
+        toward = self._toward[side]
+        return np.asarray(velocity, dtype=float) if toward is None else remove_toward(velocity, toward)
+
+    def _drop_lead_toward_singularity(self, side, actual):
+        """특이점 근접이면 앞서 있던 목표를 모두 버리고 실제 자세에서 다시 시작한다.
+
+        도달 한계에서 목표가 앞서 있으면 TCP는 거의 그대로인데 로봇 IK가 관절만 돌려 0.2초 만에 특이점에 들어갔다
+        (시뮬레이터: 위 +z, 최소 특이값 0.107 → 0.033). 특이점 쪽 성분만 버리면 막지 못했다.
+        """
+        if self._toward[side] is not None:
+            self._targets[side] = actual.copy()
+
+    def _check_stall(self, side, actual, velocity):
+        """목표가 선행 한도까지 앞선 채(팔이 못 따라옴) STALL_S가 지나면 관절 한도 때문인지 보고 로그를 남긴다.
+
+        특이점이 아니라 관절 한도로 막히는 경우(예: 레디자세 손목 arm_6가 한도 근처)는 자코비안 랭크로 알 수 없어 따로 본다.
+        """
+        now = time.perf_counter()
+        target = self._targets[side]
+        saturated = (
+            np.linalg.norm(target[:3, 3] - actual[:3, 3]) > 0.9 * settings.MAX_TARGET_LEAD_M
+            or np.linalg.norm(_rotation_lead(target, actual)) > 0.9 * settings.MAX_TARGET_LEAD_RAD
+        )
+
+        if not saturated:
+            self._stall_since[side] = None
+            return
+
+        if self._stall_since[side] is None:
+            self._stall_since[side] = now
+
+        if (
+            self._stall_reported[side]
+            or now - self._stall_since[side] < STALL_S
+            or now - self._stall_checked[side] < STALL_RECHECK_S
+        ):
+            return
+
+        self._stall_checked[side] = now
+        q = self._q[self._arm_idx(side)]
+        lower, upper = self._arm_limits[side]
+        joints = blocking_joints(self._jacobians[side], velocity, q, lower, upper, JOINT_LIMIT_NEAR_RAD)
+
+        if joints:
+            self._stall_reported[side] = True
+            detail = ", ".join(
+                f"arm_{j}({np.degrees(q[j]):.0f}°, 한도 "
+                f"{np.degrees(upper[j] if upper[j] - q[j] < q[j] - lower[j] else lower[j]):.0f}°)"
+                for j in joints
+            )
+            self.events.emit(LogMessage(f"{SIDE_NAMES[side]} {detail} 한도 때문에 그 방향으로 더 못 갑니다."))
 
     def _hold_by_follower(self, leader, follower, mirroring):
         """메인 팔 목표가 따르는 팔이 따라온 만큼(따르는 팔 목표를 메인 팔 쪽으로 되돌린 자세)보다 선행 한도 넘게 앞서지 않게 한다.
@@ -703,7 +908,7 @@ class Rby1Controller:
 
     def _build_command(self):
         body = rby.BodyComponentBasedCommandBuilder()
-        minimum_time = settings.CONTROL_PERIOD_S * 1.02
+        minimum_time = settings.COMMAND_MINIMUM_TIME_S
 
         for side in SIDES:
             header = rby.CommandHeaderBuilder().set_control_hold_time(STREAM_HOLD_TIME_S)

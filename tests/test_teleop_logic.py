@@ -30,10 +30,13 @@ from lerobot_teleoperator_spacemouse4rby1.mouse import (
 from lerobot_teleoperator_spacemouse4rby1.robot import (
     Rby1Controller,
     arm_of_link,
+    blocking_joints,
     clamp_lead,
     collision_filter,
     drop_opposing_lead,
     integrate,
+    remove_toward,
+    tcp_jacobian,
 )
 
 
@@ -420,6 +423,41 @@ def test_leader_held_when_follower_cannot_follow():
     assert np.allclose(robot._targets["right"], before) and len(logs) == 1
 
 
+def test_tcp_jacobian_moves_body_jacobian_to_tcp():
+    # ee가 base에서 z축으로 90도 돈 자세. 관절 하나가 ee z축으로만 돌면 TCP(ee z로 -0.1)는 축 위라 안 움직이고,
+    # ee x축으로 돌면 TCP가 ω × r만큼 움직인다.
+    ee = np.eye(4)
+    ee[:3, :3] = Rotation.from_euler("z", 90, degrees=True).as_matrix()
+    body = np.zeros((6, 2))
+    body[:3, 0] = [0, 0, 1]  # ee z축 회전
+    body[:3, 1] = [1, 0, 0]  # ee x축 회전
+    jacobian = tcp_jacobian(body, ee, [0, 0, -0.1])
+    assert np.allclose(jacobian[:, 0], [0, 0, 0, 0, 0, 1])
+    # ee x축은 base y축, r = (0, 0, -0.1) → ω × r = (0,1,0) × (0,0,-0.1) = (-0.1, 0, 0)
+    assert np.allclose(jacobian[:, 1], [-0.1, 0, 0, 0, 1, 0])
+
+
+def test_remove_toward_keeps_opposite_direction():
+    direction = np.array([1.0, 0, 0, 0, 0, 0])
+    assert np.allclose(remove_toward([0.5, 0.2, 0, 0, 0, 0.1], direction), [0, 0.2, 0, 0, 0, 0.1])
+    assert np.allclose(remove_toward([-0.5, 0.2, 0, 0, 0, 0], direction), [-0.5, 0.2, 0, 0, 0, 0])
+
+
+def test_blocking_joints_names_joint_at_limit():
+    # 관절 0만 x로, 관절 1만 y로 움직이는 팔. 관절 0이 위쪽 한도 바로 앞이면 +x로는 못 가고 -x로는 간다.
+    jacobian = np.zeros((6, 3))
+    jacobian[0, 0] = 1.0
+    jacobian[1, 1] = 1.0
+    jacobian[2, 2] = 1.0
+    jacobian = jacobian[:3]
+    q = np.array([1.0, 0.0, 0.0])
+    lower, upper = np.full(3, -2.0), np.array([1.02, 2.0, 2.0])
+    margin = np.radians(5)
+    assert blocking_joints(jacobian, [1, 0, 0], q, lower, upper, margin) == [0]
+    assert blocking_joints(jacobian, [-1, 0, 0], q, lower, upper, margin) == []
+    assert blocking_joints(jacobian, [0, 1, 0], q, lower, upper, margin) == []
+
+
 def test_action_carries_follow_mode():
     teleop, _ = make_teleop()
     assert "follow.mode" in teleop.action_features
@@ -528,6 +566,7 @@ def test_run_log_writes_one_row_per_cycle():
         "arm_q": {"right": np.radians(np.arange(7)), "left": np.zeros(7)},
         "min_distance": 0.09,
         "blocked": False,
+        "sigma": {"right": 0.05, "left": 0.08},
     })
 
     with tempfile.TemporaryDirectory() as directory:

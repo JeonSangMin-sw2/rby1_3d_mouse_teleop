@@ -15,6 +15,7 @@ from .events import (
     GripperChanged,
     LogMessage,
     ModeChanged,
+    SingularityChanged,
     StageChanged,
     StatusUpdated,
     Stopped,
@@ -257,6 +258,7 @@ class MonitorWindow(QtWidgets.QWidget):
         # 진행 단계(StageChanged)를 보여 주고, 충돌 경고 중에는 경고를 대신 보여 준다.
         self._stage = "-"
         self._collision = None
+        self._singular = {}  # side -> 특이점 근접 안내 글자
         self.status_label = QtWidgets.QLabel("-")
         self.status_label.setWordWrap(True)
         # 두 줄 높이로 고정해 긴 중단 사유가 들어와도 아래 칸이 밀리지 않게 한다.
@@ -361,6 +363,13 @@ class MonitorWindow(QtWidgets.QWidget):
                 if event.blocked else None
             )
             self._show_status_line()
+        elif isinstance(event, SingularityChanged):
+            if event.near:
+                self._singular[event.side] = f"{SIDE_NAMES[event.side]} 특이점 근접(σ {event.sigma:.3f})"
+            else:
+                self._singular.pop(event.side, None)
+
+            self._show_status_line()
         elif isinstance(event, StatusUpdated):
             self._show_status(event)
         elif isinstance(event, Stopped):
@@ -368,10 +377,21 @@ class MonitorWindow(QtWidgets.QWidget):
             self._show_status_line()
 
     def _show_status_line(self):
+        # 중단 > 충돌 경고 > 특이점 근접 > 진행 단계 순으로 하나만 보여 준다.
         stopped = self._stage.startswith("중단")
-        text = self._collision if self._collision is not None and not stopped else self._stage
+        singular = ", ".join(self._singular.values())
+
+        if stopped:
+            text = self._stage
+        elif self._collision is not None:
+            text = self._collision
+        elif singular:
+            text = f"{singular}, 그쪽으로 더 가는 이동만 막음"
+        else:
+            text = self._stage
+
         self.status_label.setText(text)
-        self.status_label.setStyleSheet("color: red;" if stopped or self._collision is not None else "")
+        self.status_label.setStyleSheet("color: red;" if text is not self._stage or stopped else "")
 
     def _show_modes(self, event):
         # 버튼은 누를 때 스스로 눌림 상태가 바뀌므로, 실제 모드로 다시 맞춘다.
@@ -414,6 +434,12 @@ def log_line(event):
             return f"충돌 경고: {event.link1} - {event.link2} {event.distance * 1000:.1f} mm"
 
         return "충돌 경고 해제"
+
+    if isinstance(event, SingularityChanged):
+        if event.near:
+            return f"{SIDE_NAMES[event.side]} 특이점 근접(σ {event.sigma:.3f}): 그쪽으로 더 가는 이동을 막습니다."
+
+        return f"{SIDE_NAMES[event.side]} 특이점 근접 해제(σ {event.sigma:.3f})"
 
     if isinstance(event, Stopped):
         return f"정지: {event.reason}"

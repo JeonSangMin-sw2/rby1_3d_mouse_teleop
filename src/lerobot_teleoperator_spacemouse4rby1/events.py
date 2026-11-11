@@ -36,6 +36,15 @@ class CollisionChanged:
 
 
 @dataclass(frozen=True)
+class SingularityChanged:
+    """팔의 특이점 근접 상태가 바뀔 때 보낸다. sigma는 TCP 자코비안의 최소 특이값이다."""
+
+    side: str
+    near: bool
+    sigma: float
+
+
+@dataclass(frozen=True)
 class StatusUpdated:
     """제어 주기마다 보내는 상태 요약."""
 
