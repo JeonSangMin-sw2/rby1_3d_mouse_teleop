@@ -27,6 +27,7 @@ from lerobot_teleoperator_spacemouse4rby1.mouse import (
     tool_to_base,
     x_axis_to_matrix,
 )
+from lerobot_teleoperator_spacemouse4rby1 import settings
 from lerobot_teleoperator_spacemouse4rby1.robot import (
     Rby1Controller,
     arm_of_link,
@@ -35,6 +36,7 @@ from lerobot_teleoperator_spacemouse4rby1.robot import (
     collision_filter,
     drop_opposing_lead,
     integrate,
+    lead_limits,
     remove_toward,
     tcp_jacobian,
 )
@@ -359,6 +361,34 @@ def make_pose(position, euler_deg):
     return pose
 
 
+def test_lead_limits_by_control_mode():
+    original = settings.IMPEDANCE_ENABLED
+
+    try:
+        settings.IMPEDANCE_ENABLED = False
+        assert lead_limits() == (settings.MAX_TARGET_LEAD_M, settings.MAX_TARGET_LEAD_RAD)
+        settings.IMPEDANCE_ENABLED = True
+        assert lead_limits() == (settings.IMPEDANCE_MAX_TARGET_LEAD_M, settings.IMPEDANCE_MAX_TARGET_LEAD_RAD)
+    finally:
+        settings.IMPEDANCE_ENABLED = original
+
+
+def position_control(test):
+    """settings.yaml의 impedance_enabled와 상관없이 위치 제어(선행 한도 max_target_lead_m) 기준으로 테스트한다."""
+    def wrapper():
+        original = settings.IMPEDANCE_ENABLED
+        settings.IMPEDANCE_ENABLED = False
+
+        try:
+            test()
+        finally:
+            settings.IMPEDANCE_ENABLED = original
+
+    wrapper.__name__ = test.__name__
+    return wrapper
+
+
+@position_control
 def test_follow_copies_leader_motion_without_drift():
     # 미러링: 오른팔이 움직인 만큼 왼팔 목표가 대칭으로 움직인다. 왼팔이 못 따라가는 동안 목표는 실제보다
     # 1 cm까지만 앞서지만, 잘린 몫은 버려지지 않아 왼팔이 따라오면 오른팔과 정확히 대칭이 된다.
@@ -400,6 +430,7 @@ def test_follow_stops_when_leader_stops():
     assert np.allclose(robot._targets["left"], follower_start)
 
 
+@position_control
 def test_leader_held_when_follower_cannot_follow():
     # 미러링: 왼팔이 y로 2 cm(대칭이면 오른팔 -2 cm)까지만 따라왔으면 오른팔 목표는 그보다 1 cm 넘게 못 앞선다.
     events = EventBus()

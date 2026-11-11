@@ -33,6 +33,8 @@ KEYS = (
     "elbow_limit_rad",
     "max_target_lead_m",
     "max_target_lead_rad",
+    "impedance_max_target_lead_m",
+    "impedance_max_target_lead_rad",
     "collision_distance_m",
     "collision_release_margin_m",
     "singularity_sigma_min",

@@ -115,6 +115,45 @@ SpaceMouse 경로의 그룹이 `plugdev`로, 권한이 `crw-rw----`로
 - 장치 경로는 `udevadm info -a -n /dev/hidraw5 | grep KERNELS`로
   확인할 수 있습니다.
 
+### 다시 꽂으면 권한이 풀릴 때 (Jetson 등)
+
+마우스(또는 수신기)를 뺐다 꽂으면 `/dev/hidraw*`가 새로 만들어집니다. 그래서 `sudo chmod`로
+직접 바꾼 권한은 다시 꽂는 순간 사라집니다. 권한은 위 udev 규칙으로만 주고, 아래를 확인합니다.
+
+1. 규칙 파일이 있는지 확인합니다. 없으면 위 `sudo tee` 명령으로 다시 만듭니다.
+
+   ```bash
+   cat /etc/udev/rules.d/99-spacemouse.rules
+   ```
+
+2. 사용자가 `plugdev` 그룹에 있는지 확인합니다. 출력에 `plugdev`가 없으면 추가하고
+   **로그아웃 후 다시 로그인**(또는 재부팅)합니다.
+
+   ```bash
+   groups
+   ```
+
+   ```bash
+   sudo usermod -aG plugdev $USER
+   ```
+
+   규칙의 `TAG+="uaccess"`는 화면에 직접 로그인한 사용자에게만 권한을 줍니다.
+   SSH나 원격 접속에서 실행하면 이 권한이 없으므로 `plugdev` 그룹이 꼭 필요합니다.
+   `ls -l`에서 권한 끝의 `+`는 이 uaccess 권한이 붙었다는 표시입니다.
+
+3. 마우스를 뺐다 꽂은 뒤 SpaceMouse 경로가 `root plugdev`, `crw-rw----`인지 확인합니다.
+
+   ```bash
+   grep -H HID_ID /sys/class/hidraw/hidraw*/device/uevent | grep -i 256F
+   ```
+
+   ```bash
+   ls -l /dev/hidraw*
+   ```
+
+그룹을 쓸 수 없는 환경이면 규칙의 `MODE="0660"`을 `MODE="0666"`으로 바꿔 모든 사용자가 열 수 있게 할 수 있습니다.
+다른 사용자도 마우스 입력을 읽을 수 있게 되므로 공용 PC에서는 권하지 않습니다.
+
 ## SpaceMouse 인식 확인
 
 두 SpaceMouse를 연결하고 다음 명령을 실행합니다.
@@ -251,7 +290,8 @@ python tests/view_mouse_frame.py
 | `tcp_offset_m` | 역기구학 기준점(TCP). 그리퍼 몸통 좌표계 기준 [m]. 기본은 두 손가락 끝 사이 `[0, 0, -0.133]` |
 | `arm_stiffness` 등 | 임피던스 제어 관절 게인 |
 | `elbow_limit_rad` | 팔꿈치가 다 펴져 특이점에 걸리는 것을 막음 (임피던스만) |
-| `max_target_lead_m` / `_rad` | 움직이는 동안 목표가 실제 자세보다 앞설 수 있는 최대 거리·각도 |
+| `max_target_lead_m` / `_rad` | 위치 제어에서 움직이는 동안 목표가 실제 자세보다 앞설 수 있는 최대 거리·각도 |
+| `impedance_max_target_lead_m` / `_rad` | 임피던스 제어의 같은 한도 (기본 0.05 m / 0.5 rad). 임피던스는 목표와 실제의 차이만큼의 힘으로 끌어서, 목표가 입력 속도대로 앞서 가게 두고 팔이 막혔을 때의 안전 상한으로만 씀 |
 | `collision_distance_m` | 링크 사이 경고 거리 [m] |
 | `main_arm` | 메인 팔. 트래킹·미러링에서 주도하는 팔이고 축 정렬의 기준 팔 (`right` / `left`) |
 | `deadzone`, `axis_filter_ratio` | 마우스 데드존, 가장 큰 축의 이 비율 이하인 축 무시 |
@@ -291,7 +331,7 @@ rby1-spacemouse-teleop
   `linear_velocity` / `angular_velocity` 속도입니다.
 - **손을 떼면 그 순간 목표를 실제 자세로 맞춰 바로 멈춥니다.** 앞서 있던 목표까지
   더 가지 않습니다(시뮬레이터: 놓은 뒤 더 움직인 거리 위치 제어 0.2 mm, 임피던스 0.8~1.6 mm).
-- 움직이는 동안 목표는 실제 자세보다 `max_target_lead_m` / `_rad`까지만 앞섭니다.
+- 움직이는 동안 목표는 실제 자세보다 `max_target_lead_m` / `_rad`(임피던스는 `impedance_max_target_lead_m` / `_rad`)까지만 앞섭니다.
   팔이 끝에 닿아도 옆·위로는 움직이고, 반대로 밀면 앞서 있던 거리를 버리고 바로 되돌아옵니다.
 - 위치 제어(`impedance_enabled: false`)에는 팔꿈치 한도가 없어서 팔을 끝까지 펴면
   특이점에 걸릴 수 있습니다.
@@ -330,7 +370,7 @@ rby1-spacemouse-teleop
   그만큼만 갑니다. 팔로우를 켠 순간의 두 팔 자세를 기준으로 계산하므로 어긋남이 쌓이지 않습니다.
   자기 마우스의 이동 입력은 무시하고, 그리퍼 버튼은 그대로 씁니다.
 - 반대로 따르는 팔이 관절 한도·충돌 경고 등으로 못 가면 메인 팔도 멈춥니다. 메인 팔 목표는 따르는 팔이
-  따라온 만큼보다 `max_target_lead_m` / `_rad` 넘게 앞서지 못하고, 실행 로그에
+  따라온 만큼보다 선행 한도 넘게 앞서지 못하고, 실행 로그에
   `왼팔이 따라오지 못해 오른팔도 더 가지 않습니다.`가 남습니다.
   (시뮬레이터, 트래킹으로 앞 +x 5초, 위치 제어: 손 뗀 뒤 어긋남 65 mm → 12 mm)
 - 임피던스 제어에서는 팔이 목표보다 더 밀려 나갈 수 있어, 메인 팔 목표를 붙잡아도 실제 팔이
@@ -464,239 +504,3 @@ python tests/sim_controller_check.py --help
 - [rby1-lerobot](https://github.com/RainbowRobotics/rby1-lerobot)
 - [rby1-sdk](https://github.com/RainbowRobotics/rby1-sdk)
 - [PySpaceMouse](https://spacemouse.kubaandrysek.cz/)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-(lerobot) nvidia@tegra-ubuntu:~/sy_ws/rby1_3d_mouse_teleop$ pip install -e ".[viz,ui]"
-Obtaining file:///home/nvidia/sy_ws/rby1_3d_mouse_teleop
-  Installing build dependencies ... done
-  Checking if build backend supports build_editable ... done
-  Getting requirements to build editable ... done
-  Preparing editable metadata (pyproject.toml) ... done
-Requirement already satisfied: lerobot<0.7.0,>=0.5.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (0.6.2)
-Requirement already satisfied: rby1-sdk in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (0.10.0)
-Requirement already satisfied: pyspacemouse==2.1.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (2.1.0)
-Requirement already satisfied: numpy<2.3.0,>=2.0.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (2.2.6)
-Requirement already satisfied: scipy<2.0.0,>=1.14.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (1.18.0)
-Requirement already satisfied: pyyaml<7,>=6.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (6.0.3)
-Requirement already satisfied: matplotlib<4,>=3.9 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (3.11.1)
-Collecting PyQt6<7,>=6.7 (from lerobot_teleoperator_spacemouse4rby1==0.1.0)
-  Downloading pyqt6-6.12.0.tar.gz (1.1 MB)
-     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.1/1.1 MB 18.6 MB/s  0:00:00
-  Installing build dependencies ... done
-  Getting requirements to build wheel ... done
-  Preparing metadata (pyproject.toml) ... error
-  error: subprocess-exited-with-error
-  
-  × Preparing metadata (pyproject.toml) did not run successfully.
-  │ exit code: 1
-  ╰─> [25 lines of output]
-      Traceback (most recent call last):
-        File "/home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>
-          main()
-        File "/home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 373, in main
-          json_out["return_val"] = hook(**hook_input["kwargs"])
-                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        File "/home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 178, in prepare_metadata_for_build_wheel
-          whl_basename = backend.build_wheel(metadata_directory, config_settings)
-                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/sipbuild/api.py", line 28, in build_wheel
-          project = AbstractProject.bootstrap('wheel',
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/sipbuild/abstract_project.py", line 74, in bootstrap
-          project.setup(pyproject, tool, tool_description)
-        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/sipbuild/project.py", line 708, in setup
-          self.apply_user_defaults(tool)
-        File "/tmp/pip-install-98qdx9ei/pyqt6_1e8d85bca5494a84b7650a2dea811062/project.py", line 62, in apply_user_defaults
-          super().apply_user_defaults(tool)
-        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/pyqtbuild/project.py", line 51, in apply_user_defaults
-          super().apply_user_defaults(tool)
-        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/sipbuild/project.py", line 264, in apply_user_defaults
-          self.builder.apply_user_defaults(tool)
-        File "/tmp/pip-build-env-f6l1wqjk/overlay/lib/python3.12/site-packages/pyqtbuild/builder.py", line 49, in apply_user_defaults
-          raise PyProjectOptionException('qmake',
-      sipbuild.pyproject.PyProjectOptionException
-      [end of output]
-  
-  note: This error originates from a subprocess, and is likely not a problem with pip.
-error: metadata-generation-failed
-
-× Encountered error while generating package metadata.
-╰─> PyQt6
-
-note: This is an issue with the package mentioned above, not pip.
-hint: See above for details.
-(lerobot) nvidia@tegra-ubuntu:~/sy_ws/rby1_3d_mouse_teleop$
-
-The installation is failing specifically because PyQt6 is being built from source, but the Qt build tool qmake is missing.
-
-The important error is:
-text
-
-sipbuild.pyproject.PyProjectOptionException: qmake
-
-This is not a problem with LeRobot, your SpaceMouse code, or pip itself.
-
-Your environment is Python 3.12 on an NVIDIA Tegra/Jetson system. PyQt6 is trying to compile instead of installing a prebuilt wheel.
-1. Recommended fix: Install Qt development dependencies
-
-First, install the system-level Qt tools:
-bash
-
-sudo apt update
-sudo apt install -y qt6-base-dev qt6-base-dev-tools qt6-tools-dev-tools
-
-Check whether qmake is available:
-bash
-
-which qmake6
-which qmake
-
-If qmake6 exists, try:
-bash
-
-export PATH=/usr/lib/qt6/bin:$PATH
-
-2. Retry the installation
-
-After installing Qt dependencies:
-bash
-
-cd ~/sy_ws/rby1_3d_mouse_teleop
-
-python -m pip install --upgrade pip setuptools wheel
-
-pip install -e ".[viz,ui]"
-
-3. If it still fails
-
-Check Qt installation:
-bash
-
-qmake6 -query
-
-If qmake6 works but qmake is not found:
-bash
-
-sudo ln -s /usr/lib/qt6/bin/qmake /usr/local/bin/qmake
-
-Then retry:
-bash
-
-pip install -e ".[viz,ui]"
-
-4. Alternative: Skip the UI dependency
-
-If you only need visualization and don't need the PyQt6-based UI, try:
-bash
-
-pip install -e ".[viz]"
-
-This avoids installing the ui extra and its PyQt6 dependency.
-
-One question about your hardware: Which NVIDIA Jetson are you using?
-
-    Jetson Orin Nano
-
-    Jetson Orin NX
-
-    Jetson AGX Orin
-
-    Jetson Xavier
-
-    Other
-
-The exact PyQt6 installation approach can differ depending on the JetPack/Ubuntu version and ARM64 environment.
-This might also interest you.
-Learn more
-MCP1
-One URL for your MCPs
-Connect MCP servers to Claude, Cursor and Codex.
-Ad
-
-ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
-lerobot 0.6.2 requires setuptools<82.0.0,>=71.0.0, but you have setuptools 84.2.1 which is incompatible.
-torch 2.11.0 requires setuptools<82, but you have setuptools 84.2.1 which is incompatible.
-Successfully installed pip-26.3 setuptools-84.2.1
-Obtaining file:///home/nvidia/sy_ws/rby1_3d_mouse_teleop
-  Installing build dependencies ... done
-  Checking if build backend supports build_editable ... done
-  Getting requirements to build editable ... done
-  Preparing editable metadata (pyproject.toml) ... done
-Requirement already satisfied: lerobot<0.7.0,>=0.5.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (0.6.2)
-Requirement already satisfied: rby1-sdk in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (0.10.0)
-Requirement already satisfied: pyspacemouse==2.1.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (2.1.0)
-Requirement already satisfied: numpy<2.3.0,>=2.0.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (2.2.6)
-Requirement already satisfied: scipy<2.0.0,>=1.14.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (1.18.0)
-Requirement already satisfied: pyyaml<7,>=6.0 in /home/nvidia/miniforge3/envs/lerobot/lib/python3.12/site-packages (from lerobot_teleoperator_spacemouse4rby1==0.1.0) (6.0.3)
-
-You now have a second issue: setuptools 84.2.1 is incompatible with both LeRobot 0.6.2 and PyTorch 2.11.0.
-
-Both packages require:
-text
-
-setuptools < 82
-
-The fix is straightforward. Downgrade setuptools to a compatible version.
-1. Fix setuptools
-
-Inside your existing (lerobot) environment, run:
-bash
-
-pip install "setuptools>=71,<82"
-
-I recommend pinning it to 81.0.0:
-bash
-
-pip install setuptools==81.0.0
-
-2. Verify the environment
-bash
-
-python -c "import setuptools; print(setuptools.__version__)"
-
-Expected:
-text
-
-81.0.0
-
-Check package consistency:
-bash
-
-pip check
-
-3. Retry your installation
-bash
-
-cd ~/sy_ws/rby1_3d_mouse_teleop
-
-pip install -e ".[viz,ui]"
-
-Important
-
-For your LeRobot environment, avoid upgrading setuptools to version 82 or higher because:
-
-    LeRobot 0.6.2 requires setuptools below 82.
-
-    PyTorch 2.11.0 requires setuptools below 82.
-
-My recommendation: Keep setuptools pinned at 81.0.0 in this environment to avoid breaking existing dependencies.
-
-If pip check reports additional conflicts, share its output before upgrading or reinstalling other packages.
-

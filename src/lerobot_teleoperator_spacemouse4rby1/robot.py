@@ -67,6 +67,14 @@ def detect_model(address):
     return model
 
 
+def lead_limits():
+    """목표가 실제 자세보다 앞설 수 있는 (거리 m, 각도 rad). 임피던스는 힘을 낼 만큼 앞서야 해서 따로 둔다."""
+    if settings.IMPEDANCE_ENABLED:
+        return settings.IMPEDANCE_MAX_TARGET_LEAD_M, settings.IMPEDANCE_MAX_TARGET_LEAD_RAD
+
+    return settings.MAX_TARGET_LEAD_M, settings.MAX_TARGET_LEAD_RAD
+
+
 def _rotation_lead(target, actual):
     """실제 자세에서 목표 자세까지의 base 기준 회전 벡터."""
     return Rotation.from_matrix(target[:3, :3] @ actual[:3, :3].T).as_rotvec()
@@ -236,6 +244,10 @@ class RobotStopped(RuntimeError):
 
 class Rby1Controller:
     def __init__(self, events, address=settings.ROBOT_ADDRESS):
+        for key in ("max_target_lead_m", "max_target_lead_rad", "impedance_max_target_lead_m", "impedance_max_target_lead_rad"):
+            if not getattr(settings, key.upper()) > 0.0:
+                raise ValueError(f"{key}는 0보다 커야 합니다: {getattr(settings, key.upper())!r}")
+
         if not settings.SINGULARITY_SIGMA_MIN >= 0.0:
             raise ValueError(f"singularity_sigma_min은 0 이상이어야 합니다: {settings.SINGULARITY_SIGMA_MIN!r}")
 
@@ -436,6 +448,7 @@ class Rby1Controller:
         self._moving[side] = False
 
         if abs(goal - value) >= ALIGN_TOLERANCE_M:
+            lead_m = lead_limits()[0]
             direction = np.zeros(6)
             direction[index] = np.sign(goal - value)
 
@@ -452,8 +465,8 @@ class Rby1Controller:
             value += np.clip(goal - value, -reach, reach)
             value = np.clip(
                 value,
-                actual[side][index, 3] - settings.MAX_TARGET_LEAD_M,
-                actual[side][index, 3] + settings.MAX_TARGET_LEAD_M,
+                actual[side][index, 3] - lead_m,
+                actual[side][index, 3] + lead_m,
             )
 
         self._targets[side] = start.copy()
@@ -621,8 +634,7 @@ class Rby1Controller:
                 self._targets[side] = clamp_lead(
                     target,
                     actual[side],
-                    settings.MAX_TARGET_LEAD_M,
-                    settings.MAX_TARGET_LEAD_RAD,
+                    *lead_limits(),
                 )
 
                 if side == leader and arm_mode != "normal" and self._follow_anchor is not None:
@@ -717,7 +729,7 @@ class Rby1Controller:
             target = integrate(self._targets[side], allowed, 1.0, 1.0, 1.0)
 
         self._targets[side] = clamp_lead(
-            target, actual[side], settings.MAX_TARGET_LEAD_M, settings.MAX_TARGET_LEAD_RAD
+            target, actual[side], *lead_limits()
         )
 
     def _arm_jacobian(self, state, side):
@@ -787,9 +799,10 @@ class Rby1Controller:
         """
         now = time.perf_counter()
         target = self._targets[side]
+        lead_m, lead_rad = lead_limits()
         saturated = (
-            np.linalg.norm(target[:3, 3] - actual[:3, 3]) > 0.9 * settings.MAX_TARGET_LEAD_M
-            or np.linalg.norm(_rotation_lead(target, actual)) > 0.9 * settings.MAX_TARGET_LEAD_RAD
+            np.linalg.norm(target[:3, 3] - actual[:3, 3]) > 0.9 * lead_m
+            or np.linalg.norm(_rotation_lead(target, actual)) > 0.9 * lead_rad
         )
 
         if not saturated:
@@ -833,7 +846,7 @@ class Rby1Controller:
             Rotation.from_matrix(follower_target[:3, :3] @ follower_start[:3, :3].T).as_rotvec(),
         ])
         reached = integrate(leader_start, mirror(motion) if mirroring else motion, 1.0, 1.0, 1.0)
-        held = clamp_lead(self._targets[leader], reached, settings.MAX_TARGET_LEAD_M, settings.MAX_TARGET_LEAD_RAD)
+        held = clamp_lead(self._targets[leader], reached, *lead_limits())
 
         if (
             np.linalg.norm(held[:3, 3] - self._targets[leader][:3, 3]) > FOLLOW_HOLD_LOG_M
