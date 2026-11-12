@@ -211,6 +211,10 @@ rby1-spacemouse-teleop
 
 키보드는 모니터 창에서 바로 누르거나(창의 버튼을 눌러도 됨), 터미널에 입력하고 Enter를 누릅니다.
 
+## 구조
+
+![RB-Y1 SpaceMouse 텔레옵 구조](architecture.png)
+
 ## 참고 프로젝트
 
 - [LeRobot](https://github.com/huggingface/lerobot)

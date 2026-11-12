@@ -3,25 +3,16 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 build/
+tests/
 dist/
-
-# Virtual environments
 .venv/
 venv/
-
-# Test and editor caches
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .vscode/
 .idea/
-
-# Local environment variables
 .env
 .env.*
-
-# 텔레옵 실행 기록
 logs/
-
-# archify 작업 폴더 (다이어그램 후보와 중간 결과)
 .archify/
