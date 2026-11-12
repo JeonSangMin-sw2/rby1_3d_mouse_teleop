@@ -119,13 +119,13 @@ class Gripper:
 
     def set_closed(self, closed):
         """closed: side -> bool. True면 닫는다."""
-        # 35번 예제(GRIPPER_DIRECTION=False)와 같이 닫힘이 min 엔코더, 열림이 max 엔코더다.
-        # 열 때는 max_gripper_open(0~1000)만큼만 벌린다.
+        # 실물은 닫힘이 max 엔코더, 열림이 min 엔코더다. min을 닫힘으로 두었더니(35번 예제 GRIPPER_DIRECTION=False를
+        # 따름) max_gripper_open 500에서 0~500이 아니라 500~1000으로 움직였다. 열 때는 max_gripper_open(0~1000)만큼만 벌린다.
         wide = settings.MAX_GRIPPER_OPEN / 1000.0
         opening = np.array([0.0 if closed[side] else wide for side in GRIPPER_IDS])
 
         with self._lock:
-            self._target_q = opening * (self._max_q - self._min_q) + self._min_q
+            self._target_q = self._max_q - opening * (self._max_q - self._min_q)
 
     def _loop(self):
         while self._running:

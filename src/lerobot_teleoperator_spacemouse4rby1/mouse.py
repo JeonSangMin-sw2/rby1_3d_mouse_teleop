@@ -34,6 +34,21 @@ def open_spacemouse(stack, path):
     )
 
 
+# 두 버튼(왼쪽, 오른쪽)의 HID 위치 (report, byte, bit). pyspacemouse 장치 설정마다 버튼 번호는 다르지만
+# (케이블·블루투스 LEFT 0·RIGHT 1, 동글 UniversalReceiver MENU 0·FIT 14) 이 위치는 모든 설정에서 같다.
+BUTTON_BITS = ((3, 1, 0), (3, 1, 1))
+
+
+def button_indices(device):
+    """장치 버튼 목록에서 왼쪽·오른쪽 버튼의 번호."""
+    specs = [(spec.channel, spec.byte, spec.bit) for spec in device.info.button_specs]
+
+    if not all(bits in specs for bits in BUTTON_BITS):
+        raise ValueError(f"{device.info.name}에서 왼쪽·오른쪽 버튼(report 3, byte 1, bit 0·1)을 찾지 못했습니다.")
+
+    return tuple(specs.index(bits) for bits in BUTTON_BITS)
+
+
 def read_latest(device):
     """대기 중인 입력 report를 모두 처리하고 마지막 상태를 복사해 반환한다."""
     last_t = None
@@ -49,7 +64,7 @@ def read_latest(device):
 
     # 드라이버 내부 state가 변경되어도 반환값은 유지되도록 복사한다.
     result = {axis: float(getattr(state, axis)) for axis in AXES}
-    result["buttons"] = tuple(state.buttons)
+    result["buttons"] = tuple(state.buttons[index] for index in button_indices(device))  # (왼쪽, 오른쪽)
     result["t"] = float(state.t)
 
     return result

@@ -15,7 +15,6 @@ from .events import (
     GripperChanged,
     LogMessage,
     ModeChanged,
-    SingularityChanged,
     StageChanged,
     StatusUpdated,
     Stopped,
@@ -34,6 +33,13 @@ MODE_NAMES = {
     "tool": "그리퍼",
 }
 ARM_MODE_NAMES = {"normal": "일반", "tracking": "트래킹", "mirroring": "미러링"}
+# 팔 패널 상태 블럭: 줄마다 ((상태 키, 블럭 글자), ...)와 지금 상태 블럭의 바탕색. 꺼진 블럭은 BLOCK_OFF.
+STATE_BLOCKS = {
+    "lock": ((("normal", "락 없음"), ("position_lock", "포지션락"), ("rotation_lock", "회전락")), "#00c853"),
+    "frame": ((("base", "베이스"), ("tool", "그리퍼")), "#1e88e5"),
+}
+BLOCK_OFF = "background: #e0e0e0; color: #9e9e9e;"
+BLOCK_STYLE = "border-radius: 4px; padding: 2px 6px; font-weight: bold;"
 SIDE_NAMES = {"right": "오른팔", "left": "왼팔"}
 SIDE_COLORS = {"right": QtGui.QColor("#ff7f0e"), "left": QtGui.QColor("#9467bd")}
 AXIS_COLORS = (QtGui.QColor("#d62728"), QtGui.QColor("#2ca02c"), QtGui.QColor("#1f77b4"))
@@ -49,9 +55,9 @@ SCENE_WIDTH = 420
 LOG_WIDTH = 360
 WINDOW_SIZE = (1270, 720)
 MOUSE_SHORTCUTS = (
-    ("마우스 0번", "그 팔 락 바꾸기"),
-    ("마우스 1번", "그 팔 기준 좌표계 바꾸기"),
-    ("마우스 0+1번", "그 팔 그리퍼 열기 / 닫기"),
+    ("마우스 왼쪽 버튼", "그 팔 락 바꾸기"),
+    ("마우스 오른쪽 버튼", "그 팔 기준 좌표계 바꾸기"),
+    ("두 버튼 동시에", "그 팔 그리퍼 열기 / 닫기"),
 )
 
 TCP_AXIS_LENGTH_M = 0.06
@@ -227,14 +233,39 @@ class SceneView(QtWidgets.QWidget):
             painter.drawLine(origin, to_screen(pose[:3, 3] + axis * length))
 
 
+class StateBlocks(QtWidgets.QWidget):
+    """고를 수 있는 상태를 글자 크기만 한 블럭으로 나란히 놓고, 지금 상태인 블럭만 color로 칠한다."""
+
+    def __init__(self, states, color):
+        super().__init__()
+        self.on = f"background: {color}; color: white;"
+        self.blocks = {}
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        for key, text in states:
+            block = QtWidgets.QLabel(text)
+            block.setStyleSheet(BLOCK_STYLE + BLOCK_OFF)
+            layout.addWidget(block)
+            self.blocks[key] = block
+
+        layout.addStretch(1)
+
+    def set_current(self, current):
+        for key, block in self.blocks.items():
+            block.setStyleSheet(BLOCK_STYLE + (self.on if key == current else BLOCK_OFF))
+
+
 class ArmPanel(QtWidgets.QGroupBox):
     def __init__(self, side):
         super().__init__(f"{SIDE_NAMES[side]} (메인)" if side == settings.MAIN_ARM else SIDE_NAMES[side])
-        self.labels = {name: QtWidgets.QLabel("-") for name in ("lock", "frame", "gripper", "target", "actual", "input")}
+        self.blocks = {name: StateBlocks(states, color) for name, (states, color) in STATE_BLOCKS.items()}
+        self.labels = {name: QtWidgets.QLabel("-") for name in ("gripper", "target", "actual", "input")}
         titles = {
-            "lock": "락 (0번)",
-            "frame": "기준 좌표계 (1번)",
-            "gripper": "그리퍼 (0+1번)",
+            "lock": "락 (왼쪽 버튼)",
+            "frame": "기준 좌표계 (오른쪽 버튼)",
+            "gripper": "그리퍼 (두 버튼)",
             "target": "목표 TCP 위치 (base)",
             "actual": "실제 TCP 위치 (base)",
             "input": "입력",
@@ -242,8 +273,11 @@ class ArmPanel(QtWidgets.QGroupBox):
         fixed = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
         form = QtWidgets.QFormLayout(self)
 
+        for name, blocks in self.blocks.items():
+            form.addRow(titles[name], blocks)
+
         for name, label in self.labels.items():
-            if name in ("target", "actual", "input"):
+            if name != "gripper":
                 label.setFont(fixed)
 
             form.addRow(titles[name], label)
@@ -258,7 +292,6 @@ class MonitorWindow(QtWidgets.QWidget):
         # 진행 단계(StageChanged)를 보여 주고, 충돌 경고 중에는 경고를 대신 보여 준다.
         self._stage = "-"
         self._collision = None
-        self._singular = {}  # side -> 특이점 근접 안내 글자
         self.status_label = QtWidgets.QLabel("-")
         self.status_label.setWordWrap(True)
         # 두 줄 높이로 고정해 긴 중단 사유가 들어와도 아래 칸이 밀리지 않게 한다.
@@ -363,13 +396,6 @@ class MonitorWindow(QtWidgets.QWidget):
                 if event.blocked else None
             )
             self._show_status_line()
-        elif isinstance(event, SingularityChanged):
-            if event.near:
-                self._singular[event.side] = f"{SIDE_NAMES[event.side]} 특이점 근접(σ {event.sigma:.3f})"
-            else:
-                self._singular.pop(event.side, None)
-
-            self._show_status_line()
         elif isinstance(event, StatusUpdated):
             self._show_status(event)
         elif isinstance(event, Stopped):
@@ -377,18 +403,9 @@ class MonitorWindow(QtWidgets.QWidget):
             self._show_status_line()
 
     def _show_status_line(self):
-        # 중단 > 충돌 경고 > 특이점 근접 > 진행 단계 순으로 하나만 보여 준다.
+        # 중단 > 충돌 경고 > 진행 단계 순으로 하나만 보여 준다.
         stopped = self._stage.startswith("중단")
-        singular = ", ".join(self._singular.values())
-
-        if stopped:
-            text = self._stage
-        elif self._collision is not None:
-            text = self._collision
-        elif singular:
-            text = f"{singular}, 그쪽으로 더 가는 이동만 막음"
-        else:
-            text = self._stage
+        text = self._collision if self._collision is not None and not stopped else self._stage
 
         self.status_label.setText(text)
         self.status_label.setStyleSheet("color: red;" if text is not self._stage or stopped else "")
@@ -399,8 +416,8 @@ class MonitorWindow(QtWidgets.QWidget):
             button.setChecked(event.arm_mode == arm_mode)
 
         for side, panel in self.panels.items():
-            panel.labels["lock"].setText(MODE_NAMES[event.locks[side]])
-            panel.labels["frame"].setText(MODE_NAMES[event.frames[side]])
+            panel.blocks["lock"].set_current(event.locks[side])
+            panel.blocks["frame"].set_current(event.frames[side])
 
     def _show_status(self, event):
         for side, panel in self.panels.items():
@@ -434,12 +451,6 @@ def log_line(event):
             return f"충돌 경고: {event.link1} - {event.link2} {event.distance * 1000:.1f} mm"
 
         return "충돌 경고 해제"
-
-    if isinstance(event, SingularityChanged):
-        if event.near:
-            return f"{SIDE_NAMES[event.side]} 특이점 근접(σ {event.sigma:.3f}): 그쪽으로 더 가는 이동을 막습니다."
-
-        return f"{SIDE_NAMES[event.side]} 특이점 근접 해제(σ {event.sigma:.3f})"
 
     if isinstance(event, Stopped):
         return f"정지: {event.reason}"

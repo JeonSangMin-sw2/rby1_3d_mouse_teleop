@@ -44,7 +44,6 @@ def _side_header(side):
         + [f"{side}_actual_{key}" for key in POSE_KEYS]
         + [f"{side}_q{index}_deg" for index in range(7)]
         + [f"{side}_lock", f"{side}_frame", f"{side}_gripper_closed"]
-        + [f"{side}_sigma_min"]
     )
 
 
@@ -97,7 +96,6 @@ class RunLog:
             row += [f"{v:.5f}" for v in _pose_values(cycle["actuals"][side])]
             row += [f"{v:.2f}" for v in np.rad2deg(cycle["arm_q"][side])]
             row += [teleop.locks[side], teleop.frames[side], int(teleop.gripper_closed[side])]
-            row.append(f"{cycle['sigma'][side]:.4f}")
 
         row.append(" | ".join(events))
         self._writer.writerow(row)
@@ -223,13 +221,12 @@ def run_control(teleop, events, stop, requests, run_log):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--no-ui", action="store_true", help="모니터 창 없이 터미널로만 실행")
-    args = parser.parse_args()
+    # 옵션은 없다(설정은 settings.yaml). --help로 설명만 볼 수 있게 남겨 둔다.
+    argparse.ArgumentParser(description=__doc__).parse_args()
 
     monitor = None
 
-    if not args.no_ui:
+    if settings.UI_ENABLED:
         try:
             from . import ui as monitor
         except ImportError as exc:

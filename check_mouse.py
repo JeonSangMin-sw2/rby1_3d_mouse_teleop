@@ -8,6 +8,8 @@ from contextlib import ExitStack
 
 import pyspacemouse
 
+from lerobot_teleoperator_spacemouse4rby1.mouse import button_indices
+
 AXES = ("x", "y", "z", "roll", "pitch", "yaw")
 ACTIVE_THRESHOLD = 0.08
 PRINT_PERIOD_S = 0.1
@@ -53,12 +55,14 @@ def read_latest(device):
     return state
 
 
-def format_state(state):
+def format_state(state, device):
     axes = " ".join(f"{axis}={getattr(state, axis):+.2f}" for axis in AXES)
     pressed = [i for i, value in enumerate(state.buttons) if value]
+    # 버튼 번호는 장치 설정마다 다르다(동글은 오른쪽 버튼이 14번). 텔레옵은 왼쪽·오른쪽 값만 쓴다.
+    left, right = (state.buttons[index] for index in button_indices(device))
     active = max(abs(getattr(state, axis)) for axis in AXES) > ACTIVE_THRESHOLD
 
-    return f"{axes} buttons={pressed} {'입력 중' if active else ''}"
+    return f"{axes} buttons={pressed} (왼쪽 {left}, 오른쪽 {right}) {'입력 중' if active else ''}"
 
 
 def main():
@@ -101,7 +105,7 @@ def main():
 
                 if now >= next_print:
                     for path, state in states.items():
-                        print(f"{path}: {format_state(state)}")
+                        print(f"{path}: {format_state(state, devices[path])}")
                     print(flush=True)
                     next_print = now + PRINT_PERIOD_S
 

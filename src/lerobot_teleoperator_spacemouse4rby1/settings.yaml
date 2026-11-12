@@ -1,93 +1,50 @@
 # RB-Y1 SpaceMouse 텔레옵 설정. 실행 전에 값을 바꿔서 쓴다.
 # 키를 빠뜨리거나 모르는 키가 있으면 시작할 때 오류로 멈춘다.
 
-# 로봇 주소. 127.0.0.1:50051은 시뮬레이터, 192.168.30.1:50051은 실물이다.
-robot_address: "127.0.0.1:50051"
-
-# 임피던스 활성화 여부. true면 Cartesian 임피던스 제어, false면 Cartesian 위치 제어
-impedance_enabled: true
-
-# unlimit 사용 여부. true면 control manager를 unlimited mode로 켠다. (켤 때 관절 범위를 검사하지 않는다)
-unlimited_mode: false
-
-# 디버깅용 실행 기록(CSV)을 남길지. 저장 위치는 프로젝트의 logs/ 폴더로 고정이고, 실행할 때마다 새 파일을 만든다.
-log_enabled: false
-
-# 그리퍼. UPC에서 실행할 때만 true로 둔다. (/dev/rby1_gripper 직접 사용)
-# true면 시작할 때 툴 플랜지 전압을 확인한다: 12V면 그대로, 꺼져 있으면 12V로 켜고, 다른 전압이면 끈 뒤 12V로 켠다.
-use_gripper: false
-# 그리퍼를 열었을 때 벌어지는 정도. 0~1000 (1000 = homing에서 잰 끝까지, 0 = 닫힌 상태와 같음)
-max_gripper_open: 1000
-
-# 역기구학 기준점(TCP) [m]. 그리퍼 몸통(ee_right/ee_left) 좌표계에서 본 위치다.
-# 마우스 이동·회전은 이 점을 기준으로 한다. [0, 0, 0]은 몸통 윗면(손목 쪽), [0, 0, -0.073]은 손가락이 붙은 곳,
-# [0, 0, -0.133]은 두 손가락 끝 사이다.
-tcp_offset_m: [0.0, 0.0, -0.11]
-
-# 레디자세 [deg]. 샘플 레디자세 (접이식 책상 높이 740 mm용).
-# 어깨 roll 한도(오른팔 +1도, 왼팔 -1도)에 가까우면 임피던스 제어에서 팔이 몸 안쪽으로 거의 못 들어간다
-# (시뮬레이터: 어깨 roll ∓5도는 안쪽 15 cm, ∓20도는 24 cm). 이 자세는 ∓55도라 여유가 크다.
-# 손목 arm_6가 ±150도로 한도(±155도)까지 5도, arm_5가 100도로 한도(110도)까지 10도밖에 안 남는다.
+# 주요설정 파라미터
+robot_address: "127.0.0.1:50051" # 로봇 주소. 127.0.0.1:50051은 시뮬레이터, 192.168.30.1:50051은 UPC에서의 사용 IP.
+unlimited_mode: false # 로봇 구동 시 enable 대신 unlimit쓸지 여부
+impedance_enabled: true # 임피던스 활성화 여부. true면 Cartesian 임피던스 제어, false면 Cartesian 위치 제어
+use_gripper: false # 가상에선 false로 테스트. 실물에선 true
+max_gripper_open: 1000 # 그리퍼를 열었을 때 벌어지는 정도. 0(닫힘)~1000(열림)
+ui_enabled: true 
+log_enabled: false # true 시 logs/ 폴더에 저장
+tcp_offset_m: [0.0, 0.0, -0.11] # 역기구학 기준점(TCP) [m]. 그리퍼 몸통(ee_right/ee_left) 좌표계에서의 위치.
+main_arm: right # 트래킹·미러링 시 기준이 되는 팔
 ready_pose_deg:
   torso: [0.0, -15.79, 36.58, -0.79, 0.0, 0.0]
   right_arm: [-10.0, -55.0, -30.0, -105.0, -100.0, 100.0, 150.0]
   left_arm: [-10.0, 55.0, 30.0, -105.0, 100.0, 100.0, -150.0]
 ready_minimum_time_s: 5.0
 
-# Cartesian 속도·가속도 한도. 로봇 명령의 한도이면서, 마우스를 끝까지 밀었을 때의 속도다.
+# Cartesian 공통 파라미터
 linear_velocity: 0.08 # [m/s]
 angular_velocity: 0.5 # [rad/s]
 linear_acceleration: 1.0 # [m/s^2] 임피던스 제어에서 사용
 angular_acceleration: 4.0 # [rad/s^2] 임피던스 제어에서 사용
 acceleration_limit_scaling: 0.8 # 0~1, 위치 제어에서 사용
-# 스트림 명령 하나가 목표까지 가는 최소 시간 [s]. 제어 주기(0.01)보다 길어야 한다.
-# 짧으면 천천히 밀 때 명령마다 목표에 닿아 멈췄다 출발해 끊기고, 길면 반응이 그만큼 늦어진다.
-# 마우스 값이 바뀌는 간격(블루투스 기록: 중앙값 18 ms, 95% 40 ms)보다 길게 둔다.
-# 실물 위치 제어에서 0.05도 끊겨 0.1로 늘렸다.
 command_minimum_time_s: 0.1
-# 축 정렬(키보드 x, y, z)로 따르는 팔이 움직이는 속도 [m/s]. 0보다 크고 linear_velocity 이하.
-align_velocity: 0.03
-
-# 임피던스 제어 관절 게인 (공식 lerobot-robot-rby1 오른팔 기본값)
+elbow_limit_rad: [-2.6, -0.5]
+align_velocity: 0.03 # 축 정렬(키보드 x, y, z)로 따르는 팔이 움직이는 속도 [m/s]. 0보다 크고 linear_velocity 이하.
+# 위치제어 전용 파라미터
+max_target_lead_m: 0.01 # 목표 선행 한도(위치 제어). 목표는 실제 자세보다 이만큼까지만 앞설 수 있다. (제어 주기는 코드에서 100 Hz로 고정)
+max_target_lead_rad: 0.35
+# 임피던스 제어 전용 파라미터
 arm_stiffness: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
 arm_torque_limit: [40.0, 40.0, 40.0, 30.0, 30.0, 30.0, 30.0]
 arm_damping_ratio: 1.0
-
-# 임피던스 제어에서 팔꿈치(arm_3)가 다 펴져 특이점에 걸리지 않게 막는 범위 [rad]. 위치 제어에는 적용되지 않는다.
-elbow_limit_rad: [-2.6, -0.5]
-
-# 목표 선행 한도(위치 제어). 목표는 실제 자세보다 이만큼까지만 앞설 수 있다. (제어 주기는 코드에서 100 Hz로 고정)
-max_target_lead_m: 0.01
-max_target_lead_rad: 0.35
-# 임피던스 제어의 목표 선행 한도. 임피던스는 목표와 실제의 차이 × 강성만큼의 힘으로 팔을 끌어서,
-# 위치 제어처럼 1 cm로 자르면 힘이 모자라 실물에서 거의 안 움직인다. 목표가 입력 속도대로 앞서 가게 두고
-# 팔이 막혔을 때 목표가 너무 멀어지지 않게 하는 안전 상한으로만 쓴다.
 impedance_max_target_lead_m: 0.05
 impedance_max_target_lead_rad: 0.5
 
-# 링크 사이 최소 거리 [m]. 이보다 가까우면 경고하고, 그 팔은 상대 링크에서 멀어지는 이동만 허용한다. (35번 예제 값)
+# 충돌관련 파라미터
+collision_check_enabled: false
 collision_distance_m: 0.01
-# 막힌 뒤에는 이 거리만큼 더 멀어져야 풀린다. (경계에서 막힘/풀림 반복 방지)
-collision_release_margin_m: 0.005
+collision_release_margin_m: 0.005 # 막힌 뒤에는 이 거리만큼 더 멀어져야 풀린다. (경계에서 막힘/풀림 반복 방지)
 
-# 특이점 가드 기준. 팔 TCP 자코비안([선속도 m; 각속도 rad] / rad)의 최소 특이값이 이보다 작으면 경고하고,
-# 그 팔은 특이점 쪽으로 더 들어가는 입력을 막고 앞선 목표를 버린다(빠져나오는 방향은 허용). 0이면 끈다.
-# 아직 미완성이라 꺼 둔다: 시뮬레이터에서 위로 끝까지 밀면 0.06으로 켜도 Singularity로 멈췄다.
-# (가드 없이 멈춘 지점의 최소 특이값: 위 +z 0.031, 회전 rx 0.018)
-singularity_sigma_min: 0.0
-
-# 메인 팔. 트래킹·미러링(키보드 t, m)에서 주도하는 팔이고, 높이 맞춤(키보드 z)의 기준 팔이다. right 또는 left.
-# 트래킹·미러링에서 따르는 팔의 마우스 이동 입력은 무시한다.
-main_arm: right
-
-# 마우스 입력 무시 최소값 
-deadzone: 0.05
-# 6축(이동 3, 회전 3) 중 가장 큰 입력의 이 비율 이하인 축은 무시한다. 0이면 끈다.
-axis_filter_ratio: 0.3
-# 비선형 감도. 조금 밀면 아주 천천히, 끝까지 밀면 최대 속도로 움직인다. 0이면 직선(밀린 만큼 비례).
-# 클수록 곡선이 강하다. 10이면 절반 밀었을 때 최대 속도의 23%, 4면 31%.
-# 회전은 보통 이동보다 작게 밀려서(기록상 0.2~0.4) 따로 약하게 둔다.
-translation_curve_temperature: 10.0
+# 마우스 관련 파라미터
+deadzone: 0.05 # 마우스 입력 무시 최소값 
+axis_filter_ratio: 0.3 # 입력의 비율이  일정치 이하인 축은 무시. 0이면 끈다.
+translation_curve_temperature: 10.0 # 비선형 감도. 조금 밀면 아주 천천히, 끝까지 밀면 최대 속도. 0이면 커브없음
 rotation_curve_temperature: 6.0
 
 

@@ -3,14 +3,15 @@
 send_action()은 SpaceMouse4Rby1.get_action()의 twist를 적분해 팔마다 EE 목표를 만든다.
 트래킹·미러링에서 따르는 팔은 입력 대신 메인 팔이 실제로 움직인 만큼만 움직이고,
 메인 팔은 따르는 팔이 따라온 만큼보다 선행 한도 넘게 앞서지 못한다.
-링크 사이 거리가 COLLISION_DISTANCE_M보다 가까우면 경고하고, 그 링크에 걸린 팔은
-상대 링크에서 멀어지는 이동만 허용한다(회전은 막는다).
+충돌 감지(collision_check_enabled)를 켜면 링크 사이 거리가 COLLISION_DISTANCE_M보다 가까울 때 경고하고,
+그 링크에 걸린 팔은 상대 링크에서 멀어지는 이동만 허용한다(회전은 막는다).
 """
 
 import itertools
 import re
 import time
 from contextlib import suppress
+from types import SimpleNamespace
 
 import numpy as np
 import rby1_sdk as rby
@@ -18,13 +19,17 @@ from scipy.optimize import linprog
 from scipy.spatial.transform import Rotation
 
 from . import settings
-from .events import CollisionChanged, LogMessage, SingularityChanged, StatusUpdated
+from .events import CollisionChanged, LogMessage, StatusUpdated
+from .gripper import MAX_OPENING_M
 from .mouse import ARM_MODES, mirror
+from .tool_collision import ToolCollision
 
 SIDES = ("right", "left")
 SIDE_NAMES = {"right": "오른팔", "left": "왼팔"}
 EE_LINKS = {"right": "ee_right", "left": "ee_left"}
 TORSO_LINK = "link_torso_5"  # 모니터 그림의 기준 좌표계
+# SDK 충돌 모델에서 손목·그리퍼를 덮는 링크. 두 팔의 이 링크끼리 가까우면 ToolCollision으로 다시 잰다.
+TOOL_LINKS = {"right": "link_right_arm_5", "left": "link_left_arm_5"}
 # 그리퍼 좌표계에서 z축 회전만 할 때(행동의 *_ee.wrist_only)는 base 기준 목표만 주면 7관절이 회전을
 # 나눠 맡아 어깨가 같이 돈다. arm_6를 돌리면 그리퍼가 자기 z축으로 같은 각도만큼 돌므로 arm_6에 보조 관절 목표를 함께 준다.
 # 손목만 돌릴 때 arm_6가 한도에서 이만큼 안쪽에서 멈춘다. 한도에 닿은 뒤에도 회전 목표가 들어가면
@@ -37,12 +42,10 @@ STATUS_PERIOD_S = 0.1
 COLLISION_QUERY_COUNT = 5
 ALIGN_TOLERANCE_M = 1e-4  # 정렬 목표가 이만큼 가까워지면 끝낸다.
 ALIGN_AXES = {"x": "앞뒤(x)", "y": "좌우(y)", "z": "높이(z)"}
-SINGULARITY_RELEASE_RATIO = 1.2  # 특이점 근접은 최소 특이값이 기준의 이 배수를 넘어야 풀린다 (경계에서 반복 방지)
-SINGULARITY_PROBE_M = 0.002  # 특이점 쪽 방향을 볼 때 TCP를 움직여 보는 크기 (이동)
-SINGULARITY_PROBE_RAD = 0.01  # 같은 용도 (회전)
 JOINT_LIMIT_NEAR_RAD = np.radians(5.0)  # 한도 안내: 한도까지 이만큼 안쪽인 관절을 "한도 근처"로 본다
 STALL_S = 0.3  # 목표가 선행 한도까지 앞선 채 이만큼 지나면 관절 한도 때문인지 본다
 STALL_RECHECK_S = 0.5
+ELBOW_LOG_RELEASE_RAD = np.radians(2.0)  # 팔꿈치 한도 로그: 한도에서 이만큼 안쪽으로 돌아와야 다음에 다시 남긴다
 FOLLOW_HOLD_LOG_M = 0.002  # 따르는 팔 때문에 메인 팔 목표가 이만큼 넘게 줄면 로그를 남긴다 (한 번 밀 때 한 번)
 
 
@@ -166,13 +169,6 @@ def tcp_jacobian(body_jacobian, ee_pose, tcp_offset):
     return np.vstack([linear, angular])
 
 
-def remove_toward(velocity, direction):
-    """velocity [선속도, 각속도]에서 direction(단위 벡터) 쪽으로 가는 성분만 지운다. 반대쪽은 그대로 둔다."""
-    velocity = np.asarray(velocity, dtype=float)
-    along = float(np.dot(velocity, direction))
-    return velocity - along * direction if along > 0.0 else velocity
-
-
 def blocking_joints(jacobian, velocity, q, lower, upper, margin):
     """velocity로 가려면 한도까지 margin 안쪽인 관절이 한도 쪽으로 가야 해서 못 가는지 본다.
 
@@ -204,6 +200,26 @@ def blocking_joints(jacobian, velocity, q, lower, upper, margin):
                 return list(subset)
 
     return sorted(near)
+
+
+def elbow_guard(velocity, jacobian, elbow, limits, joint=3):
+    """팔꿈치 각도(elbow)가 limits 끝에 닿아 있으면 velocity [선속도, 각속도]에서 팔꿈치를 범위 밖으로 더 미는 성분만 지운다.
+
+    TCP 속도가 팔꿈치 속도에 주는 영향은 최소 노름 역기구학(J의 의사역행렬) 기준으로 본다.
+    """
+    lower, upper = limits
+
+    if lower < elbow < upper:
+        return np.asarray(velocity, dtype=float)
+
+    outward = 1.0 if elbow >= upper else -1.0
+    gradient = np.linalg.pinv(jacobian)[joint]
+    rate = float(gradient @ velocity)
+
+    if rate * outward <= 0.0:
+        return np.asarray(velocity, dtype=float)
+
+    return np.asarray(velocity, dtype=float) - rate / float(gradient @ gradient) * gradient
 
 
 def collision_filter(side, twist, pairs):
@@ -248,9 +264,6 @@ class Rby1Controller:
             if not getattr(settings, key.upper()) > 0.0:
                 raise ValueError(f"{key}는 0보다 커야 합니다: {getattr(settings, key.upper())!r}")
 
-        if not settings.SINGULARITY_SIGMA_MIN >= 0.0:
-            raise ValueError(f"singularity_sigma_min은 0 이상이어야 합니다: {settings.SINGULARITY_SIGMA_MIN!r}")
-
         if not settings.COMMAND_MINIMUM_TIME_S > settings.CONTROL_PERIOD_S:
             raise ValueError(
                 f"command_minimum_time_s는 제어 주기({settings.CONTROL_PERIOD_S}s)보다 커야 합니다: "
@@ -281,16 +294,10 @@ class Rby1Controller:
         self._torso = np.eye(4)  # _read_poses()가 채우는 base 기준 link_torso_5 자세
         self._q = None
         self._wrist_only = {side: False for side in SIDES}
-        self._moving = {side: False for side in SIDES}  # 직전 주기에 그 팔 입력이 있었는지
         self._wrist_capped = {side: False for side in SIDES}  # 손목 한도로 회전을 막고 있는지 (로그 한 번만)
         self._wrist_limits = None  # connect()가 채우는 팔별 arm_6 (하한, 상한) [rad]
         self._arm_limits = None  # connect()가 채우는 팔별 7관절 (하한 배열, 상한 배열) [rad]
-        # 특이점에서 빠져나오는 방향을 볼 때 쓰는 FK 상태. 이번 주기 FK(_fk_state)를 건드리지 않게 따로 둔다.
-        self._probe_state = None
-        self._jacobians = {}  # 이번 주기 팔별 TCP 자코비안 (6×7, [선속도; 각속도], base 방향)
-        self._sigma = {side: np.inf for side in SIDES}  # 이번 주기 TCP 자코비안의 최소 특이값
-        self._singular = {side: False for side in SIDES}
-        self._toward = {side: None for side in SIDES}  # 특이점 근접일 때 특이점 쪽으로 가는 [선속도, 각속도] 단위 방향
+        self._jacobians = {}  # 이번 주기 팔별 TCP 자코비안 (6×7, [선속도; 각속도], base 방향). 관절 한도 안내에 쓴다.
         self._stall_since = {side: None for side in SIDES}
         self._stall_checked = {side: 0.0 for side in SIDES}
         self._stall_reported = {side: False for side in SIDES}
@@ -299,6 +306,7 @@ class Rby1Controller:
         # 팔로우 기준: 팔로우를 시작할 때의 (메인 팔 실제 자세, 따르는 팔 목표 자세). None이면 다음 주기에 다시 잡는다.
         self._follow_anchor = None
         self._follower_holding = False  # 따르는 팔이 못 따라와 메인 팔을 붙잡고 있다고 로그를 남겼는지
+        self._elbow_limited = {side: False for side in SIDES}  # 팔꿈치 한도에 닿았다고 로그를 남겼는지 (위치 제어)
         self.last_cycle = None
 
         self._targets = None
@@ -307,6 +315,7 @@ class Rby1Controller:
         self._last_status = 0.0
         self._blocked = False
         self._gripper_closed = None
+        self._tool_collision = None  # connect()가 만든다
 
     @property
     def is_connected(self):
@@ -321,8 +330,9 @@ class Rby1Controller:
 
         self._model = self._robot.model()
         self._dynamics = self._robot.get_dynamics()
+        # 링크 순서: base, ee(오른팔, 왼팔), torso_5, arm_5(오른팔, 왼팔). compute_transformation 번호로 쓴다.
         self._fk_state = self._dynamics.make_state(
-            ["base", *EE_LINKS.values(), TORSO_LINK],
+            ["base", *EE_LINKS.values(), TORSO_LINK, *TOOL_LINKS.values()],
             self._model.robot_joint_names,
         )
         lower = self._dynamics.get_limit_q_lower(self._fk_state)
@@ -333,10 +343,11 @@ class Rby1Controller:
         self._arm_limits = {
             side: (np.asarray(lower)[self._arm_idx(side)], np.asarray(upper)[self._arm_idx(side)]) for side in SIDES
         }
-        self._probe_state = self._dynamics.make_state(
-            ["base", *EE_LINKS.values(), TORSO_LINK],
-            self._model.robot_joint_names,
-        )
+
+        if settings.COLLISION_CHECK_ENABLED:
+            self._tool_collision = ToolCollision(self._mount_z())
+        else:
+            self.events.emit(LogMessage("충돌 감지가 꺼져 있습니다(collision_check_enabled: false). 팔끼리·몸통과 부딪혀도 막지 않습니다."))
 
         self._power_on()
 
@@ -411,7 +422,6 @@ class Rby1Controller:
 
         self._targets = self._read_poses()[0]
         self._wrist_only = {side: False for side in SIDES}
-        self._moving = {side: False for side in SIDES}
         self._align_goal = {side: None for side in SIDES}
         self._follow_anchor = None
         self._reset_reference = True
@@ -445,7 +455,6 @@ class Rby1Controller:
         index = "xyz".index(axis)
         value = self._targets[side][index, 3]
         self._wrist_only[side] = False
-        self._moving[side] = False
 
         if abs(goal - value) >= ALIGN_TOLERANCE_M:
             lead_m = lead_limits()[0]
@@ -456,9 +465,9 @@ class Rby1Controller:
                 self._end_align(side, f"{SIDE_NAMES[side]} 충돌 경고로 정렬을 멈춥니다.")
                 return
 
-            # 특이점 쪽 성분을 지우고 나서 맞추는 축 방향이 절반도 안 남으면 그 축으로는 특이점에 들어가는 중이다.
-            if abs(self._guard_singularity(side, direction)[index]) < 0.5:
-                self._end_align(side, f"{SIDE_NAMES[side]} 특이점 근처라 정렬을 멈춥니다.")
+            # 팔꿈치를 범위 밖으로 미는 성분을 지우고 나서 맞추는 축 방향이 절반도 안 남으면 그 축으로는 못 간다.
+            if abs(self._guard_elbow(side, direction)[index]) < 0.5:
+                self._end_align(side, f"{SIDE_NAMES[side]} 팔꿈치 한도에 닿아 정렬을 멈춥니다.")
                 return
 
             reach = settings.ALIGN_VELOCITY * dt
@@ -479,8 +488,6 @@ class Rby1Controller:
 
     def _end_align(self, side, message):
         self._align_goal[side] = None
-        # 목표를 지금 그대로 두고 멈춘다. (손 뗄 때처럼 실제 자세로 바꾸지 않는다)
-        self._moving[side] = False
         self.events.emit(LogMessage(message))
 
     def reinitialize(self):
@@ -537,7 +544,7 @@ class Rby1Controller:
             raise RuntimeError(f"레디자세 이동이 끝나지 않았습니다: {feedback.finish_code}")
 
     def _read_poses(self):
-        """현재 TCP 자세와 가까운 링크 쌍 목록을 반환한다."""
+        """현재 TCP 자세와 가까운 링크 쌍 목록을 반환한다. 충돌 감지가 꺼져 있으면 링크 쌍은 빈 목록이다."""
         q = np.asarray(self._robot.get_state().position, dtype=float)
         self._q = q
         self._fk_state.set_q(q)
@@ -549,10 +556,65 @@ class Rby1Controller:
         }
         self._torso = np.array(self._dynamics.compute_transformation(self._fk_state, 0, len(SIDES) + 1))
         self._jacobians = {side: self._arm_jacobian(self._fk_state, side) for side in SIDES}
+        if not settings.COLLISION_CHECK_ENABLED:
+            return poses, []
+
         pairs = self._dynamics.detect_collisions_or_nearest_links(
             self._fk_state, COLLISION_QUERY_COUNT
         )
-        return poses, pairs
+        return poses, self._refine_tool_pair(pairs)
+
+    def _link_pose(self, index):
+        return np.array(self._dynamics.compute_transformation(self._fk_state, 0, index))
+
+    def _mount_z(self):
+        """그리퍼 장착면(ee 원점)의 arm_5 좌표 z. 관절 각도와 상관없는 기구 치수라 지금 자세로 한 번 잰다."""
+        self._fk_state.set_q(np.asarray(self._robot.get_state().position, dtype=float))
+        self._dynamics.compute_forward_kinematics(self._fk_state)
+        return float((np.linalg.inv(self._link_pose(len(SIDES) + 2)) @ self._link_pose(1))[2, 3])
+
+    def _gripper_opening(self, side):
+        """충돌 계산에 쓸 손가락 하나의 벌림 [m]. 닫힘이면 0, 그 밖(모름 포함)은 열었을 때의 벌림."""
+        if self._gripper_closed is not None and self._gripper_closed[side]:
+            return 0.0
+
+        return MAX_OPENING_M * settings.MAX_GRIPPER_OPEN / 1000.0
+
+    def _refine_tool_pair(self, pairs):
+        """SDK가 두 팔 arm_5 캡슐끼리 가깝다고 하면 실제 손목·그리퍼 모양으로 다시 잰 거리로 바꾼다.
+
+        SDK 캡슐은 그리퍼까지 반지름 7.5 cm로 덮어 실제보다 일찍 막혔다. 다른 링크 쌍은 그대로 둔다.
+        """
+        openings = {side: self._gripper_opening(side) for side in SIDES}
+        within = settings.COLLISION_DISTANCE_M + settings.COLLISION_RELEASE_MARGIN_M
+        # 그리퍼는 열면 캡슐 밖으로 조금 나와서, SDK 거리가 이보다 커야 실제로도 within보다 멀다고 할 수 있다.
+        trigger = within + sum(self._tool_collision.protrusion(openings[side]) for side in SIDES)
+        result = []
+
+        for pair in pairs:
+            if {pair.link1, pair.link2} != set(TOOL_LINKS.values()) or pair.distance >= trigger:
+                result.append(pair)
+                continue
+
+            distance, points = self._tool_collision.distance(
+                {side: self._link_pose(index) for index, side in enumerate(SIDES, start=len(SIDES) + 2)},
+                {side: self._link_pose(index) for index, side in enumerate(SIDES, start=1)},
+                openings,
+                within,
+            )
+
+            if points is None:
+                distance = within  # 실제로는 within보다 멀다.
+                points = {side: (pair.position1 if TOOL_LINKS[side] == pair.link1 else pair.position2) for side in SIDES}
+
+            side1 = arm_of_link(pair.link1)
+            side2 = arm_of_link(pair.link2)
+            result.append(SimpleNamespace(
+                link1=pair.link1, link2=pair.link2, distance=distance,
+                position1=points[side1], position2=points[side2],
+            ))
+
+        return sorted(result, key=lambda pair: pair.distance)
 
     def send_action(self, action):
         if not self.is_connected:
@@ -586,7 +648,6 @@ class Rby1Controller:
                     if any(side in (arm_of_link(p.link1), arm_of_link(p.link2)) for p in near):
                         self._targets[side] = actual[side]
 
-        self._update_singularity()
         linear_speed = settings.LINEAR_VELOCITY
         angular_speed = settings.ANGULAR_VELOCITY
         scale = np.array([linear_speed] * 3 + [angular_speed] * 3)  # twist(-1~1) → [m/s, rad/s]
@@ -622,13 +683,13 @@ class Rby1Controller:
                 self._follow_anchor = None
 
             twist = collision_filter(side, twist, near)
-            twist = self._guard_singularity(side, twist * scale) / scale
+            twist = self._guard_elbow(side, twist * scale) / scale
+            self._drop_lead_past_elbow(side, actual[side])
             inputs[side] = twist
             moving = bool(np.any(twist != 0.0))
             self._wrist_only[side] = moving and action[f"{side}_ee.wrist_only"] > 0.5
 
             if moving:
-                self._drop_lead_toward_singularity(side, actual[side])
                 target = drop_opposing_lead(self._targets[side], actual[side], twist)
                 target = integrate(target, twist, dt, linear_speed, angular_speed)
                 self._targets[side] = clamp_lead(
@@ -644,12 +705,9 @@ class Rby1Controller:
                     self._cap_wrist_target(side)
 
                 self._check_stall(side, actual[side], twist * scale)
-            elif self._moving[side]:
-                # 손을 뗀 순간 목표를 실제 자세로 맞춰, 앞서 있던 목표까지 더 가지 않고 바로 멈춘다.
-                # 그 뒤로는 이 자세를 계속 목표로 둔다(매 주기 실제 자세로 바꾸면 처지는 만큼 따라 내려간다).
-                self._targets[side] = actual[side].copy()
 
-            self._moving[side] = moving
+            # 손을 떼도 목표는 그대로 둔다(뗀 뒤에도 앞선 만큼 더 감). 뗄 때 실제 자세로 맞췄더니 늦어 있던 만큼이
+            # 사라져 조금 미는 입력이 덜 갔다(시뮬레이터 6 mm 밀기: 위치 제어 5.4 mm, 임피던스 3.8 mm).
 
             if not moving:
                 self._stall_since[side] = None
@@ -681,7 +739,6 @@ class Rby1Controller:
             },
             "min_distance": min_distance,
             "blocked": blocked,
-            "sigma": dict(self._sigma),
         }
 
         if now - self._last_status >= STATUS_PERIOD_S:
@@ -702,7 +759,6 @@ class Rby1Controller:
         기준에서의 변화로 매번 다시 계산한다.
         """
         self._wrist_only[side] = False
-        self._moving[side] = False
 
         if self._follow_anchor is None:
             self._follow_anchor = (actual[leader].copy(), self._targets[side].copy())
@@ -720,8 +776,7 @@ class Rby1Controller:
             desired[:3, 3] - self._targets[side][:3, 3],
             _rotation_lead(desired, self._targets[side]),
         ])
-        allowed = self._guard_singularity(side, collision_filter(side, step, near))
-        self._drop_lead_toward_singularity(side, actual[side])
+        allowed = self._guard_elbow(side, collision_filter(side, step, near))
 
         if np.array_equal(allowed, step):
             target = desired
@@ -731,6 +786,7 @@ class Rby1Controller:
         self._targets[side] = clamp_lead(
             target, actual[side], *lead_limits()
         )
+        self._drop_lead_past_elbow(side, actual[side])
 
     def _arm_jacobian(self, state, side):
         """state의 FK로 그 팔의 TCP 자코비안(6×7)을 만든다. compute_forward_kinematics 뒤에 부른다."""
@@ -739,63 +795,46 @@ class Rby1Controller:
         body = np.asarray(self._dynamics.compute_body_jacobian(state, 0, index))[:, self._arm_idx(side)]
         return tcp_jacobian(body, ee_pose, settings.TCP_OFFSET_M)
 
-    def _update_singularity(self):
-        """팔마다 TCP 자코비안의 최소 특이값을 보고, 기준 아래면 특이점 쪽 방향을 구해 둔다.
+    def _guard_elbow(self, side, velocity):
+        """위치 제어에서 팔꿈치가 elbow_limit_rad 끝에 닿아 있으면 그 밖으로 더 미는 성분을 지운다.
 
-        로봇은 특이점에 닿으면 스스로 제어를 끝낸다(Singularity). 그 전에 그쪽 입력만 막아 멈추지 않게 한다.
+        위치 제어용 Cartesian 명령(CartesianCommandBuilder)에는 관절 한도(add_joint_limit)가 없어 여기서 막는다.
+        임피던스는 SDK add_joint_limit으로 막으므로 그대로 둔다.
         """
-        for side in SIDES:
-            sigma = np.linalg.svd(self._jacobians[side], compute_uv=False)[-1]
-            self._sigma[side] = sigma
-            threshold = settings.SINGULARITY_SIGMA_MIN * (
-                SINGULARITY_RELEASE_RATIO if self._singular[side] else 1.0
-            )
-            near = sigma < threshold
-            self._toward[side] = self._singular_toward(side) if near else None
+        if settings.IMPEDANCE_ENABLED:
+            return np.asarray(velocity, dtype=float)
 
-            if near != self._singular[side]:
-                self._singular[side] = near
-                self.events.emit(SingularityChanged(side, near, float(sigma)))
+        elbow = self._q[self._arm_idx(side)[3]]
+        lower, upper = settings.ELBOW_LIMIT_RAD
 
-    def _singular_toward(self, side):
-        """TCP를 움직이면 최소 특이값이 줄어드는 방향([선속도, 각속도] 단위 벡터). 축마다 조금 움직여 본 기울기로 구한다.
+        if not lower < elbow < upper and not self._elbow_limited[side]:
+            self._elbow_limited[side] = True
+            self.events.emit(LogMessage(
+                f"{SIDE_NAMES[side]} 팔꿈치(arm_3 {np.degrees(elbow):.0f}°)가 한도 "
+                f"[{np.degrees(lower):.0f}°, {np.degrees(upper):.0f}°]에 닿아 그 방향으로 더 가지 않습니다."
+            ))
+        elif lower + ELBOW_LOG_RELEASE_RAD < elbow < upper - ELBOW_LOG_RELEASE_RAD:
+            # 한도 경계에서 들락날락할 때 로그가 반복되지 않게, 충분히 안쪽으로 돌아와야 다시 남긴다.
+            self._elbow_limited[side] = False
 
-        최소 특이값 방향(특이 벡터) 성분만 막으면 나머지 성분으로 계속 특이점에 들어가 멈췄다
-        (시뮬레이터: 위 +z, 회전 rx). 그래서 최소 특이값을 실제로 깎는 방향을 막는다.
-        """
-        inverse = np.linalg.pinv(self._jacobians[side])
-        gradient = np.zeros(6)
+        return elbow_guard(velocity, self._jacobians[side], elbow, settings.ELBOW_LIMIT_RAD)
 
-        for axis in range(6):
-            step = SINGULARITY_PROBE_M if axis < 3 else SINGULARITY_PROBE_RAD
-            q = self._q.copy()
-            q[self._arm_idx(side)] += inverse[:, axis] * step
-            self._probe_state.set_q(q)
-            self._dynamics.compute_forward_kinematics(self._probe_state)
-            sigma = np.linalg.svd(self._arm_jacobian(self._probe_state, side), compute_uv=False)[-1]
-            gradient[axis] = (sigma - self._sigma[side]) / step
+    def _drop_lead_past_elbow(self, side, actual):
+        """목표가 팔꿈치를 범위 밖으로 미는 쪽으로 앞서 있으면 그만큼 버린다. (손을 떼도 앞선 목표로 더 펴지지 않게)"""
+        target = self._targets[side]
+        lead = np.concatenate([target[:3, 3] - actual[:3, 3], _rotation_lead(target, actual)])
+        kept = self._guard_elbow(side, lead)
 
-        norm = np.linalg.norm(gradient)
-        return -gradient / norm if norm > 0.0 else None
-
-    def _guard_singularity(self, side, velocity):
-        """특이점 근접이면 velocity [선속도, 각속도]에서 특이점 쪽 성분만 지운다."""
-        toward = self._toward[side]
-        return np.asarray(velocity, dtype=float) if toward is None else remove_toward(velocity, toward)
-
-    def _drop_lead_toward_singularity(self, side, actual):
-        """특이점 근접이면 앞서 있던 목표를 모두 버리고 실제 자세에서 다시 시작한다.
-
-        도달 한계에서 목표가 앞서 있으면 TCP는 거의 그대로인데 로봇 IK가 관절만 돌려 0.2초 만에 특이점에 들어갔다
-        (시뮬레이터: 위 +z, 최소 특이값 0.107 → 0.033). 특이점 쪽 성분만 버리면 막지 못했다.
-        """
-        if self._toward[side] is not None:
-            self._targets[side] = actual.copy()
+        if not np.allclose(kept, lead):
+            target = actual.copy()
+            target[:3, 3] += kept[:3]
+            target[:3, :3] = Rotation.from_rotvec(kept[3:]).as_matrix() @ actual[:3, :3]
+            self._targets[side] = target
 
     def _check_stall(self, side, actual, velocity):
         """목표가 선행 한도까지 앞선 채(팔이 못 따라옴) STALL_S가 지나면 관절 한도 때문인지 보고 로그를 남긴다.
 
-        특이점이 아니라 관절 한도로 막히는 경우(예: 레디자세 손목 arm_6가 한도 근처)는 자코비안 랭크로 알 수 없어 따로 본다.
+        예: 레디자세 손목 arm_5·arm_6가 한도 근처라 아래로 못 내려가는 경우.
         """
         now = time.perf_counter()
         target = self._targets[side]
@@ -965,6 +1004,7 @@ class Rby1Controller:
                         settings.ACCELERATION_LIMIT_SCALING,
                     )
                 )
+                # stop_*_tracking_error를 VR 예제처럼 0으로 줘 봤지만 시뮬레이터에서 작은 이동(6 mm)·속도 차이가 없어 기본값을 둔다.
                 # 자세 유지용으로 add_joint_position_target을 관절 0~5에 걸어 봤지만 관절이 그 자리에 묶여
                 # 그리퍼가 전혀 움직이지 않았다 (시뮬레이터, 2026-11-11). 위치 제어에는 자세 유지를 걸지 않는다.
 
