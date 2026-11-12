@@ -35,6 +35,7 @@ KEYS = (
     "max_target_lead_rad",
     "impedance_max_target_lead_m",
     "impedance_max_target_lead_rad",
+    "stall_progress_ratio",
     "collision_check_enabled",
     "collision_distance_m",
     "collision_release_margin_m",

@@ -35,6 +35,10 @@ arm_torque_limit: [40.0, 40.0, 40.0, 30.0, 30.0, 30.0, 30.0]
 arm_damping_ratio: 1.0
 impedance_max_target_lead_m: 0.05
 impedance_max_target_lead_rad: 0.5
+# 막힘 판단(위치 제어). 목표가 선행 한도까지 앞서 있는데 실제 TCP가 입력 방향으로 명령 속도의 이 비율도 못 가는 채
+# 0.3초가 지나면 막힌 것으로 보고, 그 방향 입력을 멈춘다(손을 떼거나 방향을 바꾸면 풀림). 막힌 방향으로 계속 밀면 팔이 흔들린다.
+# 크게 하면 일찍 멈춰 덜 흔들리지만 덜 가고, 작게 하면 더 가지만 더 흔들린다. 0이면 끈다(관절 한도 안내 로그도 안 나옴).
+stall_progress_ratio: 0.3
 
 # 충돌관련 파라미터
 collision_check_enabled: false

@@ -43,8 +43,9 @@ COLLISION_QUERY_COUNT = 5
 ALIGN_TOLERANCE_M = 1e-4  # 정렬 목표가 이만큼 가까워지면 끝낸다.
 ALIGN_AXES = {"x": "앞뒤(x)", "y": "좌우(y)", "z": "높이(z)"}
 JOINT_LIMIT_NEAR_RAD = np.radians(5.0)  # 한도 안내: 한도까지 이만큼 안쪽인 관절을 "한도 근처"로 본다
-STALL_S = 0.3  # 목표가 선행 한도까지 앞선 채 이만큼 지나면 관절 한도 때문인지 본다
-STALL_RECHECK_S = 0.5
+STALL_S = 0.3  # 목표가 선행 한도까지 앞서 있고 팔이 거의 못 가는 채 이만큼 지나면 막힌 것으로 본다
+STALL_STARTUP_S = 0.5  # 밀기 시작하고 이 시간 동안은 막힘을 판단하지 않는다 (팔이 출발하는 데 0.2~0.4초 걸림)
+STALL_RELEASE_COS = np.cos(np.radians(45.0))  # 막힌 방향에서 입력 방향이 이 각도보다 벌어지면 막힘을 푼다
 ELBOW_LOG_RELEASE_RAD = np.radians(2.0)  # 팔꿈치 한도 로그: 한도에서 이만큼 안쪽으로 돌아와야 다음에 다시 남긴다
 FOLLOW_HOLD_LOG_M = 0.002  # 따르는 팔 때문에 메인 팔 목표가 이만큼 넘게 줄면 로그를 남긴다 (한 번 밀 때 한 번)
 
@@ -222,6 +223,13 @@ def elbow_guard(velocity, jacobian, elbow, limits, joint=3):
     return np.asarray(velocity, dtype=float) - rate / float(gradient @ gradient) * gradient
 
 
+def drop_component(velocity, direction):
+    """velocity에서 direction(단위 벡터) 쪽으로 가는 성분만 지운다. 반대쪽과 수직 성분은 그대로 둔다."""
+    velocity = np.asarray(velocity, dtype=float)
+    along = float(velocity @ direction)
+    return velocity - along * direction if along > 0.0 else velocity
+
+
 def collision_filter(side, twist, pairs):
     """가까운 링크 쌍(pairs)에 걸린 팔의 twist에서 허용되는 부분만 남긴다.
 
@@ -264,6 +272,9 @@ class Rby1Controller:
             if not getattr(settings, key.upper()) > 0.0:
                 raise ValueError(f"{key}는 0보다 커야 합니다: {getattr(settings, key.upper())!r}")
 
+        if not 0.0 <= settings.STALL_PROGRESS_RATIO < 1.0:
+            raise ValueError(f"stall_progress_ratio는 0 이상 1 미만이어야 합니다: {settings.STALL_PROGRESS_RATIO!r}")
+
         if not settings.COMMAND_MINIMUM_TIME_S > settings.CONTROL_PERIOD_S:
             raise ValueError(
                 f"command_minimum_time_s는 제어 주기({settings.CONTROL_PERIOD_S}s)보다 커야 합니다: "
@@ -299,8 +310,10 @@ class Rby1Controller:
         self._arm_limits = None  # connect()가 채우는 팔별 7관절 (하한 배열, 상한 배열) [rad]
         self._jacobians = {}  # 이번 주기 팔별 TCP 자코비안 (6×7, [선속도; 각속도], base 방향). 관절 한도 안내에 쓴다.
         self._stall_since = {side: None for side in SIDES}
-        self._stall_checked = {side: 0.0 for side in SIDES}
+        self._stall_start = {side: None for side in SIDES}  # 막힘 판단 구간을 시작할 때의 실제 TCP 자세
         self._stall_reported = {side: False for side in SIDES}
+        self._stall_dir = {side: None for side in SIDES}  # 막힌 입력 방향 [선속도, 각속도] 단위 벡터 (위치 제어)
+        self._push_since = {side: None for side in SIDES}  # 그 팔 입력이 들어오기 시작한 시각
         self._actual = None  # 이번 주기에 읽은 실제 TCP 자세
         self._align_goal = {side: None for side in SIDES}  # 정렬 중인 팔의 (축, 목표값 [m], 시작할 때의 목표 자세)
         # 팔로우 기준: 팔로우를 시작할 때의 (메인 팔 실제 자세, 따르는 팔 목표 자세). None이면 다음 주기에 다시 잡는다.
@@ -424,6 +437,8 @@ class Rby1Controller:
         self._wrist_only = {side: False for side in SIDES}
         self._align_goal = {side: None for side in SIDES}
         self._follow_anchor = None
+        self._stall_since = {side: None for side in SIDES}
+        self._stall_dir = {side: None for side in SIDES}
         self._reset_reference = True
         self._last_update = None
         self._stream = self._robot.create_command_stream(priority=1)
@@ -684,6 +699,7 @@ class Rby1Controller:
 
             twist = collision_filter(side, twist, near)
             twist = self._guard_elbow(side, twist * scale) / scale
+            twist = self._apply_stall(side, twist * scale) / scale
             self._drop_lead_past_elbow(side, actual[side])
             inputs[side] = twist
             moving = bool(np.any(twist != 0.0))
@@ -712,6 +728,9 @@ class Rby1Controller:
             if not moving:
                 self._stall_since[side] = None
                 self._stall_reported[side] = False
+                self._push_since[side] = None
+            elif self._push_since[side] is None:
+                self._push_since[side] = time.perf_counter()
 
             if side == leader and not moving:
                 self._follower_holding = False
@@ -831,10 +850,27 @@ class Rby1Controller:
             target[:3, :3] = Rotation.from_rotvec(kept[3:]).as_matrix() @ actual[:3, :3]
             self._targets[side] = target
 
-    def _check_stall(self, side, actual, velocity):
-        """목표가 선행 한도까지 앞선 채(팔이 못 따라옴) STALL_S가 지나면 관절 한도 때문인지 보고 로그를 남긴다.
+    def _apply_stall(self, side, velocity):
+        """막힌 방향(_stall_dir)이 있으면 velocity에서 그 방향 성분을 지운다. 손을 떼거나 방향을 바꾸면 풀린다."""
+        direction = self._stall_dir[side]
 
-        예: 레디자세 손목 arm_5·arm_6가 한도 근처라 아래로 못 내려가는 경우.
+        if direction is None:
+            return velocity
+
+        speed = np.linalg.norm(velocity)
+
+        if speed == 0.0 or velocity @ direction / speed < STALL_RELEASE_COS:
+            self._stall_dir[side] = None
+            return velocity
+
+        return drop_component(velocity, direction)
+
+    def _check_stall(self, side, actual, velocity):
+        """목표가 선행 한도까지 앞서 있는데 실제 TCP가 입력 방향으로 거의 못 가는 채 STALL_S가 지나면 막힌 것으로 본다.
+
+        위치 제어에서는 막힌 방향으로 계속 밀면 IK가 해를 오가며 팔이 흔들려서(시뮬레이터: 레디자세에서 아래로 밀 때
+        관절 속도 방향이 2초에 47~64번 바뀜), 앞선 목표를 버리고 그 방향 입력을 막는다. 임피던스는 마찰을 넘기 전에
+        목표를 끊으면 아예 안 움직일 수 있어 막지 않는다. 관절 한도 때문이면 어느 관절인지 로그로 알린다.
         """
         now = time.perf_counter()
         target = self._targets[side]
@@ -843,34 +879,54 @@ class Rby1Controller:
             np.linalg.norm(target[:3, 3] - actual[:3, 3]) > 0.9 * lead_m
             or np.linalg.norm(_rotation_lead(target, actual)) > 0.9 * lead_rad
         )
+        speed = np.linalg.norm(velocity)
+        # 밀기 시작한 직후에는 목표만 먼저 앞서고 팔은 아직 출발 전이라 막힌 것처럼 보인다.
+        starting = self._push_since[side] is None or now - self._push_since[side] < STALL_STARTUP_S
 
-        if not saturated:
+        if not saturated or speed == 0.0 or starting:
             self._stall_since[side] = None
             return
 
         if self._stall_since[side] is None:
             self._stall_since[side] = now
-
-        if (
-            self._stall_reported[side]
-            or now - self._stall_since[side] < STALL_S
-            or now - self._stall_checked[side] < STALL_RECHECK_S
-        ):
+            self._stall_start[side] = actual.copy()
             return
 
-        self._stall_checked[side] = now
-        q = self._q[self._arm_idx(side)]
-        lower, upper = self._arm_limits[side]
-        joints = blocking_joints(self._jacobians[side], velocity, q, lower, upper, JOINT_LIMIT_NEAR_RAD)
+        elapsed = now - self._stall_since[side]
 
-        if joints:
+        if elapsed < STALL_S:
+            return
+
+        start = self._stall_start[side]
+        moved = np.concatenate([actual[:3, 3] - start[:3, 3], _rotation_lead(actual, start)])
+        # 앞서 있어도 입력 방향으로 잘 따라오는 중이면 막힌 것이 아니다. 창을 새로 시작한다.
+        if moved @ velocity / speed / elapsed >= settings.STALL_PROGRESS_RATIO * speed:
+            self._stall_since[side] = now
+            self._stall_start[side] = actual.copy()
+            return
+
+        self._stall_since[side] = None
+
+        if not self._stall_reported[side]:
             self._stall_reported[side] = True
-            detail = ", ".join(
-                f"arm_{j}({np.degrees(q[j]):.0f}°, 한도 "
-                f"{np.degrees(upper[j] if upper[j] - q[j] < q[j] - lower[j] else lower[j]):.0f}°)"
-                for j in joints
-            )
-            self.events.emit(LogMessage(f"{SIDE_NAMES[side]} {detail} 한도 때문에 그 방향으로 더 못 갑니다."))
+            q = self._q[self._arm_idx(side)]
+            lower, upper = self._arm_limits[side]
+            joints = blocking_joints(self._jacobians[side], velocity, q, lower, upper, JOINT_LIMIT_NEAR_RAD)
+
+            if joints:
+                detail = ", ".join(
+                    f"arm_{j}({np.degrees(q[j]):.0f}°, 한도 "
+                    f"{np.degrees(upper[j] if upper[j] - q[j] < q[j] - lower[j] else lower[j]):.0f}°)"
+                    for j in joints
+                )
+                self.events.emit(LogMessage(f"{SIDE_NAMES[side]} {detail} 한도 때문에 그 방향으로 더 못 갑니다."))
+
+        if not settings.IMPEDANCE_ENABLED:
+            self._stall_dir[side] = velocity / speed
+            self._targets[side] = actual.copy()
+            self.events.emit(LogMessage(
+                f"{SIDE_NAMES[side]}이 그 방향으로 막혀 미는 입력을 멈춥니다. 손을 떼거나 방향을 바꾸면 다시 움직입니다."
+            ))
 
     def _hold_by_follower(self, leader, follower, mirroring):
         """메인 팔 목표가 따르는 팔이 따라온 만큼(따르는 팔 목표를 메인 팔 쪽으로 되돌린 자세)보다 선행 한도 넘게 앞서지 않게 한다.

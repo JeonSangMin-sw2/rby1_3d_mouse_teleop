@@ -171,6 +171,7 @@ python check_mouse.py
 | `elbow_limit_rad` | 팔꿈치가 다 펴져 특이점에 걸리지 않게 막는 범위 [rad]. 범위 끝에 닿으면 그 방향으로 더 가지 않음 |
 | `max_target_lead_m`, `max_target_lead_rad` | 목표가 실제 자세보다 앞설 수 있는 최대 거리·각도 (위치 제어) |
 | `impedance_max_target_lead_m`, `impedance_max_target_lead_rad` | 같은 한도 (임피던스 제어). 실물에서 덜 움직이면 늘림 |
+| `stall_progress_ratio` | 막힌 방향으로 계속 밀 때 팔이 흔들리지 않게 그 방향 입력을 멈추는 기준 (위치 제어). 크면 일찍 멈춰 덜 흔들리고, 작으면 더 감. 0이면 끔 |
 | `collision_check_enabled` | 팔끼리·몸통과 가까워지면 경고하고 막을지. **기본 `false`(꺼짐)** |
 | `collision_distance_m`, `collision_release_margin_m` | 충돌 경고 거리와, 경고가 풀리는 데 필요한 추가 거리 [m] |
 | `main_arm` | 메인 팔 (`right` / `left`). 트래킹·미러링과 축 정렬의 기준 |
